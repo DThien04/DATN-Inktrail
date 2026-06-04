@@ -1,0 +1,3105 @@
+﻿const prisma = require("../../config/prisma");
+const notificationService = require("../notification/notification.service");
+const userService = require("../user/user.service");
+const {
+  recomputeChapterFeaturedComment,
+} = require("../comment/comment-featured.service");
+const {
+  analyzeReportCaseAi,
+  analyzeReportCaseAppealAi,
+} = require("./report-ai.service");
+const { dispatchAiAnalyze } = require("../../queues/ai-analyze.queue");
+const { dispatchNotification } = require("../../queues/notification.queue");
+const {
+  enqueueReportCaseAiFollowup,
+  enqueueReportAppealAiFollowup,
+  isReportAiFollowupQueueEnabled,
+} = require("../../queues/report-ai-followup.queue");
+const {
+  calculateReportCaseRisk,
+  deriveReportCasePriority,
+} = require("./report-case-scoring");
+
+const ALLOWED_COMMENT_REPORT_REASONS = new Set([
+  "spam",
+  "abuse",
+  "hate",
+  "sexual",
+  "violence",
+  "other",
+]);
+const ALLOWED_CONTENT_REPORT_REASONS = new Set([
+  "spam",
+  "copyright",
+  "sexual",
+  "violence",
+  "hate",
+  "misleading",
+  "other",
+]);
+const ADMIN_REPORT_TYPES = new Set([
+  "story",
+  "chapter",
+  "chapter_comment",
+]);
+const CONTENT_REPORT_STATUSES = new Set([
+  "pending",
+  "dismissed",
+  "action_taken",
+]);
+const COMMENT_REPORT_STATUSES = new Set([
+  "pending",
+  "dismissed",
+  "removed",
+]);
+const REPORT_AI_MAX_ATTEMPTS = 2;
+const REPORT_AI_RETRY_DELAY_MS = 5000;
+
+const normalizeText = (value) => String(value ?? "").trim();
+const isAdmin = (requester) => requester?.role === "admin";
+
+const buildReportTargetLink = ({ type, storySlug, chapterId }) => {
+  if (type === "story" && storySlug) return `/stories/${storySlug}`;
+  if (storySlug && chapterId) return `/stories/${storySlug}/chapters/${chapterId}`;
+  return null;
+};
+
+const summarizeReportAiForUser = (reportCase) => {
+  const summary = normalizeText(reportCase?.aiSummary);
+  if (summary) return summary;
+  return "Bên mình đã nhận báo cáo của bạn. Đội ngũ đang xem xét và sẽ gửi kết quả sớm.";
+};
+
+const summarizeAppealAiForUser = (reportCase) => {
+  const summary = normalizeText(reportCase?.appealAiSummary);
+  if (summary) return summary;
+  return "Khiếu nại của bạn đã được tiếp nhận và chuyển đến quản trị viên để xem xét.";
+};
+
+/**
+ * Legacy in-process scheduler (setTimeout) - chỉ dùng làm fallback khi Redis
+ * không khả dụng. Khi có queue, code đi qua wrapper bên dưới và logic này
+ * được bỏ qua hoàn toàn.
+ */
+const legacyScheduleReportCaseAiAnalysis = ({
+  type,
+  caseId,
+  recipientId,
+  storyId,
+  chapterId,
+  storySlug,
+  attempt = 1,
+}) => {
+  setTimeout(async () => {
+    try {
+      const analyzed = await analyzeReportCaseAi({ type, caseId });
+      if (!analyzed || !recipientId) return;
+
+      await dispatchNotification({
+        recipientId,
+        actorId: null,
+        storyId: storyId ?? null,
+        chapterId: chapterId ?? null,
+        type: "admin_message",
+        title: "Báo cáo của bạn đang được xem xét",
+        body: summarizeReportAiForUser(analyzed),
+        linkUrl: buildReportTargetLink({ type, storySlug, chapterId }),
+        meta: {
+          case_id: analyzed.id,
+          audience: "reporter",
+          report_type: type,
+          resolution_action: "report_ai_analyzed",
+          ai_checked_at: analyzed.aiCheckedAt ?? null,
+          ai_flagged: Boolean(analyzed.aiFlagged),
+          ai_suggested_action: analyzed.aiSuggestedAction ?? null,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[report-ai-background:error]",
+        JSON.stringify({
+          case_id: caseId,
+          report_type: type,
+          attempt,
+          message: error?.message || String(error),
+        }),
+      );
+      if (attempt < REPORT_AI_MAX_ATTEMPTS) {
+        legacyScheduleReportCaseAiAnalysis({
+          type,
+          caseId,
+          recipientId,
+          storyId,
+          chapterId,
+          storySlug,
+          attempt: attempt + 1,
+        });
+      }
+    }
+  }, attempt === 1 ? 0 : REPORT_AI_RETRY_DELAY_MS);
+};
+
+const legacyScheduleReportAppealAiAnalysis = ({
+  caseId,
+  recipientId,
+  storyId,
+  chapterId,
+  storySlug,
+  reportType,
+  attempt = 1,
+}) => {
+  setTimeout(async () => {
+    try {
+      const analyzed = await analyzeReportCaseAppealAi({ caseId });
+      if (!analyzed || !recipientId) return;
+
+      await dispatchNotification({
+        recipientId,
+        actorId: null,
+        storyId: storyId ?? null,
+        chapterId: chapterId ?? null,
+        type: "admin_message",
+        title: "Khiếu nại của bạn đang được xem xét",
+        body: summarizeAppealAiForUser(analyzed),
+        linkUrl: buildReportTargetLink({
+          type: reportType,
+          storySlug,
+          chapterId,
+        }),
+        meta: {
+          case_id: analyzed.id,
+          audience: "owner",
+          report_type: reportType,
+          resolution_action: "appeal_ai_analyzed",
+          appeal_ai_checked_at: analyzed.appealAiCheckedAt ?? null,
+          appeal_ai_recommendation: analyzed.appealAiRecommendation ?? null,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[appeal-ai-background:error]",
+        JSON.stringify({
+          case_id: caseId,
+          attempt,
+          message: error?.message || String(error),
+        }),
+      );
+      if (attempt < REPORT_AI_MAX_ATTEMPTS) {
+        legacyScheduleReportAppealAiAnalysis({
+          caseId,
+          recipientId,
+          storyId,
+          chapterId,
+          storySlug,
+          reportType,
+          attempt: attempt + 1,
+        });
+      }
+    }
+  }, attempt === 1 ? 0 : REPORT_AI_RETRY_DELAY_MS);
+};
+
+const scheduleReportCaseAiAnalysis = (payload) => {
+  if (!payload?.caseId) return;
+  if (!isReportAiFollowupQueueEnabled()) {
+    legacyScheduleReportCaseAiAnalysis(payload);
+    return;
+  }
+  void enqueueReportCaseAiFollowup(payload).catch((error) => {
+    console.error("[schedule-case-ai-followup:enqueue-error]", {
+      case_id: payload.caseId,
+      message: error?.message || String(error),
+    });
+    legacyScheduleReportCaseAiAnalysis(payload);
+  });
+};
+
+const scheduleReportAppealAiAnalysis = (payload) => {
+  if (!payload?.caseId) return;
+  if (!isReportAiFollowupQueueEnabled()) {
+    legacyScheduleReportAppealAiAnalysis(payload);
+    return;
+  }
+  void enqueueReportAppealAiFollowup(payload).catch((error) => {
+    console.error("[schedule-appeal-ai-followup:enqueue-error]", {
+      case_id: payload.caseId,
+      message: error?.message || String(error),
+    });
+    legacyScheduleReportAppealAiAnalysis(payload);
+  });
+};
+
+const validateCommentReportReason = (reason) => {
+  const normalizedReason = normalizeText(reason).toLowerCase();
+  if (!ALLOWED_COMMENT_REPORT_REASONS.has(normalizedReason)) {
+    throw new Error("Lý do báo cáo không hợp lệ.");
+  }
+  return normalizedReason;
+};
+
+const validateContentReportReason = (reason) => {
+  const normalizedReason = normalizeText(reason).toLowerCase();
+  if (!ALLOWED_CONTENT_REPORT_REASONS.has(normalizedReason)) {
+    throw new Error("Lý do báo cáo không hợp lệ.");
+  }
+  return normalizedReason;
+};
+
+const validateCommentReportDescription = (description) => {
+  const normalizedDescription = normalizeText(description);
+  if (!normalizedDescription) return null;
+  if (normalizedDescription.length > 500) {
+    throw new Error("Mô tả báo cáo tối đa 500 ký tự.");
+  }
+  return normalizedDescription;
+};
+
+const validateContentReportDescription = (description) => {
+  const normalizedDescription = normalizeText(description);
+  if (!normalizedDescription) {
+    throw new Error("Vui lòng nhập mô tả báo cáo.");
+  }
+  if (normalizedDescription.length > 500) {
+    throw new Error("Mô tả báo cáo tối đa 500 ký tự.");
+  }
+  return normalizedDescription;
+};
+
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return fallback;
+  return parsed;
+};
+
+const getRequesterDisplayName = (requester) =>
+  normalizeText(
+    requester?.displayName ||
+      requester?.display_name ||
+      requester?.email ||
+      "Quản trị viên",
+  );
+
+const validateAdminReportType = (type) => {
+  const normalizedType = normalizeText(type).toLowerCase();
+  if (!ADMIN_REPORT_TYPES.has(normalizedType)) {
+    throw new Error("Loại báo cáo không hợp lệ.");
+  }
+  return normalizedType;
+};
+
+const validateAdminReportStatus = ({ type, status }) => {
+  const normalizedStatus = normalizeText(status).toLowerCase();
+  if (!normalizedStatus) return null;
+
+  const allowedStatuses =
+    type === "chapter_comment"
+      ? COMMENT_REPORT_STATUSES
+      : CONTENT_REPORT_STATUSES;
+
+  if (!allowedStatuses.has(normalizedStatus)) {
+    throw new Error("Trạng thái báo cáo không hợp lệ.");
+  }
+  return normalizedStatus;
+};
+
+const buildReportSummary = ({ type, report }) => {
+  const reporter = report.reporter ?? {};
+
+  if (type === "story") {
+    const story = report.story ?? {};
+    return {
+      id: report.id,
+      case_id: report.reportCase?.id ?? null,
+      case_status: report.reportCase?.status ?? null,
+      case_resolution_action: report.reportCase?.resolutionAction ?? null,
+      case_last_resolution_action:
+        report.reportCase?.lastResolutionAction ?? null,
+      case_report_count: report.reportCase?.reportCount ?? null,
+      case_unique_reporter_count: report.reportCase?.uniqueReporterCount ?? null,
+      case_risk_score: report.reportCase?.riskScore ?? null,
+      case_priority: report.reportCase?.priority ?? null,
+      case_reopened_count: report.reportCase?.reopenedCount ?? null,
+      case_last_reported_at: report.reportCase?.lastReportedAt ?? null,
+      case_restored_at: report.reportCase?.restoredAt ?? null,
+      case_restored_by_id: report.reportCase?.restoredById ?? null,
+      case_account_lock_applied: report.reportCase?.accountLockApplied ?? false,
+      case_account_locked_user_id: report.reportCase?.accountLockedUserId ?? null,
+      case_ai_flagged: report.reportCase?.aiFlagged ?? false,
+      case_ai_categories: report.reportCase?.aiCategories ?? null,
+      case_ai_confidence: report.reportCase?.aiConfidence ?? null,
+      case_ai_severity: report.reportCase?.aiSeverity ?? null,
+      case_ai_summary: report.reportCase?.aiSummary ?? null,
+      case_ai_suggested_action: report.reportCase?.aiSuggestedAction ?? null,
+      case_ai_checked_at: report.reportCase?.aiCheckedAt ?? null,
+      case_appeal_status: report.reportCase?.appealStatus ?? null,
+      case_appeal_reason: report.reportCase?.appealReason ?? null,
+      case_appeal_submitted_at: report.reportCase?.appealSubmittedAt ?? null,
+      case_appeal_resolved_at: report.reportCase?.appealResolvedAt ?? null,
+      case_appeal_resolved_by_id:
+        report.reportCase?.appealResolvedById ?? null,
+      case_appeal_ai_summary: report.reportCase?.appealAiSummary ?? null,
+      case_appeal_ai_recommendation:
+        report.reportCase?.appealAiRecommendation ?? null,
+      case_appeal_ai_confidence:
+        report.reportCase?.appealAiConfidence ?? null,
+      case_appeal_ai_checked_at: report.reportCase?.appealAiCheckedAt ?? null,
+      type,
+      reason: report.reason,
+      description: report.description,
+      status: report.status,
+      created_at: report.createdAt,
+      updated_at: report.updatedAt,
+      resolved_at: report.resolvedAt,
+      reporter: {
+        id: reporter.id,
+        display_name: reporter.displayName,
+        email: reporter.email,
+      },
+      target: {
+        id: story.id,
+        title: story.title,
+        slug: story.slug,
+        description: story.description,
+        cover_url: story.coverUrl,
+        status: story.status,
+        is_hidden: Boolean(story.isHidden),
+        hidden_at: story.hiddenAt ?? null,
+        tags: Array.isArray(story.storyTags)
+          ? story.storyTags
+              .map((item) => item.tag)
+              .filter(Boolean)
+              .map((tag) => ({
+                id: tag.id,
+                name: tag.name,
+              }))
+          : [],
+        author: story.author
+            ? {
+                id: story.author.id,
+                display_name: story.author.displayName,
+                email: story.author.email,
+              }
+            : null,
+      },
+    };
+  }
+
+  if (type === "chapter") {
+    const chapter = report.chapter ?? {};
+    const story = chapter.story ?? {};
+    return {
+      id: report.id,
+      case_id: report.reportCase?.id ?? null,
+      case_status: report.reportCase?.status ?? null,
+      case_resolution_action: report.reportCase?.resolutionAction ?? null,
+      case_last_resolution_action:
+        report.reportCase?.lastResolutionAction ?? null,
+      case_report_count: report.reportCase?.reportCount ?? null,
+      case_unique_reporter_count: report.reportCase?.uniqueReporterCount ?? null,
+      case_risk_score: report.reportCase?.riskScore ?? null,
+      case_priority: report.reportCase?.priority ?? null,
+      case_reopened_count: report.reportCase?.reopenedCount ?? null,
+      case_last_reported_at: report.reportCase?.lastReportedAt ?? null,
+      case_restored_at: report.reportCase?.restoredAt ?? null,
+      case_restored_by_id: report.reportCase?.restoredById ?? null,
+      case_account_lock_applied: report.reportCase?.accountLockApplied ?? false,
+      case_account_locked_user_id: report.reportCase?.accountLockedUserId ?? null,
+      case_ai_flagged: report.reportCase?.aiFlagged ?? false,
+      case_ai_categories: report.reportCase?.aiCategories ?? null,
+      case_ai_confidence: report.reportCase?.aiConfidence ?? null,
+      case_ai_severity: report.reportCase?.aiSeverity ?? null,
+      case_ai_summary: report.reportCase?.aiSummary ?? null,
+      case_ai_suggested_action: report.reportCase?.aiSuggestedAction ?? null,
+      case_ai_checked_at: report.reportCase?.aiCheckedAt ?? null,
+      case_appeal_status: report.reportCase?.appealStatus ?? null,
+      case_appeal_reason: report.reportCase?.appealReason ?? null,
+      case_appeal_submitted_at: report.reportCase?.appealSubmittedAt ?? null,
+      case_appeal_resolved_at: report.reportCase?.appealResolvedAt ?? null,
+      case_appeal_resolved_by_id:
+        report.reportCase?.appealResolvedById ?? null,
+      case_appeal_ai_summary: report.reportCase?.appealAiSummary ?? null,
+      case_appeal_ai_recommendation:
+        report.reportCase?.appealAiRecommendation ?? null,
+      case_appeal_ai_confidence:
+        report.reportCase?.appealAiConfidence ?? null,
+      case_appeal_ai_checked_at: report.reportCase?.appealAiCheckedAt ?? null,
+      type,
+      reason: report.reason,
+      description: report.description,
+      status: report.status,
+      created_at: report.createdAt,
+      updated_at: report.updatedAt,
+      resolved_at: report.resolvedAt,
+      reporter: {
+        id: reporter.id,
+        display_name: reporter.displayName,
+        email: reporter.email,
+      },
+      target: {
+        id: chapter.id,
+        chapter_number: chapter.chapterNumber,
+        title: chapter.title,
+        content_preview: normalizeText(chapter.content).slice(0, 1200),
+        content_truncated: normalizeText(chapter.content).length > 1200,
+        status: chapter.status,
+        is_hidden: Boolean(chapter.isHidden),
+        hidden_at: chapter.hiddenAt ?? null,
+        story: story.id
+            ? {
+                id: story.id,
+                title: story.title,
+                slug: story.slug,
+                author: story.author
+                    ? {
+                        id: story.author.id,
+                        display_name: story.author.displayName,
+                        email: story.author.email,
+                      }
+                    : null,
+              }
+            : null,
+      },
+    };
+  }
+
+  const comment = report.comment ?? {};
+  const chapter = comment.chapter ?? {};
+  const story = chapter.story ?? {};
+  const commentAuthor = comment.user ?? {};
+  return {
+    id: report.id,
+    case_id: report.reportCase?.id ?? null,
+    case_status: report.reportCase?.status ?? null,
+    case_resolution_action: report.reportCase?.resolutionAction ?? null,
+    case_last_resolution_action:
+      report.reportCase?.lastResolutionAction ?? null,
+    case_report_count: report.reportCase?.reportCount ?? null,
+    case_unique_reporter_count: report.reportCase?.uniqueReporterCount ?? null,
+    case_risk_score: report.reportCase?.riskScore ?? null,
+    case_priority: report.reportCase?.priority ?? null,
+    case_reopened_count: report.reportCase?.reopenedCount ?? null,
+    case_last_reported_at: report.reportCase?.lastReportedAt ?? null,
+    case_restored_at: report.reportCase?.restoredAt ?? null,
+    case_restored_by_id: report.reportCase?.restoredById ?? null,
+    case_account_lock_applied: report.reportCase?.accountLockApplied ?? false,
+    case_account_locked_user_id: report.reportCase?.accountLockedUserId ?? null,
+    case_ai_flagged: report.reportCase?.aiFlagged ?? false,
+    case_ai_categories: report.reportCase?.aiCategories ?? null,
+    case_ai_confidence: report.reportCase?.aiConfidence ?? null,
+    case_ai_severity: report.reportCase?.aiSeverity ?? null,
+    case_ai_summary: report.reportCase?.aiSummary ?? null,
+    case_ai_suggested_action: report.reportCase?.aiSuggestedAction ?? null,
+    case_ai_checked_at: report.reportCase?.aiCheckedAt ?? null,
+    case_appeal_status: report.reportCase?.appealStatus ?? null,
+    case_appeal_reason: report.reportCase?.appealReason ?? null,
+    case_appeal_submitted_at: report.reportCase?.appealSubmittedAt ?? null,
+    case_appeal_resolved_at: report.reportCase?.appealResolvedAt ?? null,
+    case_appeal_resolved_by_id: report.reportCase?.appealResolvedById ?? null,
+    case_appeal_ai_summary: report.reportCase?.appealAiSummary ?? null,
+    case_appeal_ai_recommendation:
+      report.reportCase?.appealAiRecommendation ?? null,
+    case_appeal_ai_confidence: report.reportCase?.appealAiConfidence ?? null,
+    case_appeal_ai_checked_at: report.reportCase?.appealAiCheckedAt ?? null,
+    type,
+    reason: report.reason,
+    description: report.description,
+    status: report.status,
+    created_at: report.createdAt,
+    updated_at: report.updatedAt,
+    resolved_at: report.resolvedAt,
+    reporter: {
+      id: reporter.id,
+      display_name: reporter.displayName,
+      email: reporter.email,
+    },
+    target: {
+      id: comment.id,
+      content: comment.content,
+      is_edited: comment.isEdited,
+      is_hidden: Boolean(comment.isHidden),
+      hidden_at: comment.hiddenAt ?? null,
+      created_at: comment.createdAt,
+      author: commentAuthor.id
+          ? {
+              id: commentAuthor.id,
+              display_name: commentAuthor.displayName,
+              email: commentAuthor.email,
+            }
+          : null,
+      chapter: chapter.id
+          ? {
+              id: chapter.id,
+              chapter_number: chapter.chapterNumber,
+              title: chapter.title,
+              story: story.id
+                  ? {
+                      id: story.id,
+                      title: story.title,
+                      slug: story.slug,
+                    }
+                  : null,
+            }
+          : null,
+    },
+  };
+};
+
+const getAdminReportInclude = (type) => {
+  if (type === "story") {
+    return {
+      reportCase: {
+        select: {
+          id: true,
+          status: true,
+          priority: true,
+          resolutionAction: true,
+          lastResolutionAction: true,
+          riskScore: true,
+          reportCount: true,
+          uniqueReporterCount: true,
+          reopenedCount: true,
+          aiFlagged: true,
+          aiCategories: true,
+          aiConfidence: true,
+          aiSeverity: true,
+          aiSummary: true,
+          aiSuggestedAction: true,
+          aiCheckedAt: true,
+          appealStatus: true,
+          appealReason: true,
+          appealSubmittedAt: true,
+          appealResolvedAt: true,
+          appealResolvedById: true,
+          appealAiSummary: true,
+          appealAiRecommendation: true,
+          appealAiConfidence: true,
+          appealAiCheckedAt: true,
+          lastReportedAt: true,
+          resolvedAt: true,
+          restoredAt: true,
+          restoredById: true,
+          accountLockApplied: true,
+          accountLockedUserId: true,
+        },
+      },
+      reporter: {
+        select: { id: true, displayName: true, email: true },
+      },
+      story: {
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          description: true,
+          coverUrl: true,
+          status: true,
+          isHidden: true,
+          hiddenAt: true,
+          hiddenById: true,
+          hiddenReason: true,
+          author: {
+            select: { id: true, displayName: true, email: true },
+          },
+          storyTags: {
+            select: {
+              tag: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  if (type === "chapter") {
+    return {
+      reportCase: {
+        select: {
+          id: true,
+          status: true,
+          priority: true,
+          resolutionAction: true,
+          lastResolutionAction: true,
+          riskScore: true,
+          reportCount: true,
+          uniqueReporterCount: true,
+          reopenedCount: true,
+          aiFlagged: true,
+          aiCategories: true,
+          aiConfidence: true,
+          aiSeverity: true,
+          aiSummary: true,
+          aiSuggestedAction: true,
+          aiCheckedAt: true,
+          appealStatus: true,
+          appealReason: true,
+          appealSubmittedAt: true,
+          appealResolvedAt: true,
+          appealResolvedById: true,
+          appealAiSummary: true,
+          appealAiRecommendation: true,
+          appealAiConfidence: true,
+          appealAiCheckedAt: true,
+          lastReportedAt: true,
+          resolvedAt: true,
+          restoredAt: true,
+          restoredById: true,
+          accountLockApplied: true,
+          accountLockedUserId: true,
+        },
+      },
+      reporter: {
+        select: { id: true, displayName: true, email: true },
+      },
+      chapter: {
+        select: {
+          id: true,
+          chapterNumber: true,
+          title: true,
+          content: true,
+          status: true,
+          isHidden: true,
+          hiddenAt: true,
+          hiddenById: true,
+          hiddenReason: true,
+          story: {
+            select: {
+              id: true,
+              title: true,
+              slug: true,
+              author: {
+                select: { id: true, displayName: true, email: true },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  return {
+    reportCase: {
+      select: {
+        id: true,
+        status: true,
+        priority: true,
+        resolutionAction: true,
+        lastResolutionAction: true,
+        riskScore: true,
+        reportCount: true,
+        uniqueReporterCount: true,
+        reopenedCount: true,
+        aiFlagged: true,
+        aiCategories: true,
+        aiConfidence: true,
+        aiSeverity: true,
+        aiSummary: true,
+        aiSuggestedAction: true,
+        aiCheckedAt: true,
+        appealStatus: true,
+        appealReason: true,
+        appealSubmittedAt: true,
+        appealResolvedAt: true,
+        appealResolvedById: true,
+        appealAiSummary: true,
+        appealAiRecommendation: true,
+        appealAiConfidence: true,
+        appealAiCheckedAt: true,
+        lastReportedAt: true,
+        resolvedAt: true,
+        restoredAt: true,
+        restoredById: true,
+        accountLockApplied: true,
+        accountLockedUserId: true,
+      },
+    },
+    reporter: {
+      select: { id: true, displayName: true, email: true },
+    },
+    comment: {
+      select: {
+        id: true,
+        content: true,
+        isEdited: true,
+        isHidden: true,
+        hiddenAt: true,
+        createdAt: true,
+        user: {
+          select: { id: true, displayName: true, email: true },
+        },
+        chapter: {
+          select: {
+            id: true,
+            chapterNumber: true,
+            title: true,
+            story: {
+              select: {
+                id: true,
+                title: true,
+                slug: true,
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+};
+
+const getAdminReportDelegate = (type, db = prisma) => {
+  if (type === "story") return db.storyReport;
+  if (type === "chapter") return db.chapterReport;
+  return db.chapterCommentReport;
+};
+
+const getReportCaseTargetType = (type) => {
+  if (type === "story") return "story";
+  if (type === "chapter") return "chapter";
+  return "chapter_comment";
+};
+
+const deriveReportCaseState = ({ type, reports }) => {
+  const hasPending = reports.some((report) => report.status === "pending");
+  if (hasPending) {
+    return {
+      status: "pending",
+      resolutionAction: null,
+      resolvedAt: null,
+    };
+  }
+
+  if (type === "chapter_comment") {
+    return {
+      status: "resolved",
+      resolutionAction: reports.some((report) => report.status === "removed")
+        ? "comment_removed"
+        : "ignored",
+      resolvedAt: reports.reduce((latest, report) => {
+        const candidate = report.resolvedAt ?? report.updatedAt ?? latest;
+        return candidate > latest ? candidate : latest;
+      }, new Date(0)),
+    };
+  }
+
+  return {
+    status: "resolved",
+    resolutionAction: reports.some((report) => report.status === "action_taken")
+      ? type === "story"
+        ? "story_hidden"
+        : "chapter_hidden"
+      : "ignored",
+    resolvedAt: reports.reduce((latest, report) => {
+      const candidate = report.resolvedAt ?? report.updatedAt ?? latest;
+      return candidate > latest ? candidate : latest;
+    }, new Date(0)),
+  };
+};
+
+const ensureReportCase = async ({ db = prisma, type, targetId }) => {
+  const targetType = getReportCaseTargetType(type);
+  return db.reportCase.upsert({
+    where: {
+      targetType_targetId: {
+        targetType,
+        targetId,
+      },
+    },
+    update: {},
+    create: {
+      targetType,
+      targetId,
+      status: "pending",
+      priority: "low",
+      lastReportedAt: new Date(),
+    },
+    select: { id: true, status: true },
+  });
+};
+
+const reopenReportCaseIfNeeded = async ({ db = prisma, caseId }) => {
+  if (!caseId) return;
+  await db.reportCase.updateMany({
+    where: {
+      id: caseId,
+      status: "resolved",
+    },
+    data: {
+      reopenedCount: {
+        increment: 1,
+      },
+    },
+  });
+};
+
+const syncReportCase = async ({ db = prisma, type, caseId }) => {
+  const delegate = getAdminReportDelegate(type, db);
+    const existingCase = await db.reportCase.findUnique({
+      where: { id: caseId },
+      select: {
+        id: true,
+        reopenedCount: true,
+        lastResolutionAction: true,
+        aiFlagged: true,
+        aiConfidence: true,
+        aiSeverity: true,
+        aiSuggestedAction: true,
+      },
+    });
+  if (!existingCase) return null;
+
+  const reports = await delegate.findMany({
+    where: { caseId },
+    select: {
+      status: true,
+      reporterId: true,
+      reason: true,
+      createdAt: true,
+      updatedAt: true,
+      resolvedAt: true,
+    },
+  });
+
+  if (!reports.length) return null;
+
+  const state = deriveReportCaseState({ type, reports });
+  const reportCount = reports.length;
+  const uniqueReporterCount = new Set(reports.map((report) => report.reporterId)).size;
+  const lastReportedAt = reports.reduce((latest, report) => {
+    return report.createdAt > latest ? report.createdAt : latest;
+  }, reports[0].createdAt);
+    const riskScore = calculateReportCaseRisk({
+      reports,
+      reopenedCount: existingCase.reopenedCount,
+      ai: {
+        flagged: existingCase.aiFlagged,
+        confidence: existingCase.aiConfidence,
+        severity: existingCase.aiSeverity,
+        suggestedAction: existingCase.aiSuggestedAction,
+      },
+    });
+  const priority = deriveReportCasePriority(riskScore);
+
+  return db.reportCase.update({
+    where: { id: caseId },
+    data: {
+      status: state.status,
+      priority,
+      resolutionAction: state.resolutionAction,
+      lastResolutionAction:
+        state.status === "resolved"
+          ? state.resolutionAction
+          : existingCase.lastResolutionAction,
+      riskScore,
+      reportCount,
+      uniqueReporterCount,
+      lastReportedAt,
+      resolvedAt: state.status === "pending" ? null : state.resolvedAt,
+    },
+    select: { id: true },
+  });
+};
+
+const ensureChapterCommentCanBeReported = async ({ commentId, requester }) => {
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const normalizedCommentId = normalizeText(commentId);
+  if (!normalizedCommentId) throw new Error("Thiếu thông tin bình luận.");
+
+  const comment = await prisma.chapterComment.findUnique({
+    where: { id: normalizedCommentId },
+    include: {
+      chapter: {
+        include: {
+          story: {
+            select: {
+              id: true,
+              title: true,
+              slug: true,
+              authorId: true,
+              status: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!comment) throw new Error("Không tìm thấy bình luận.");
+  if (comment.isHidden) {
+    throw new Error("Bình luận này đã bị gỡ.");
+  }
+
+  const isStoryOwner = comment.chapter.story.authorId === requester.id;
+  const canViewDraft = Boolean(isStoryOwner || isAdmin(requester));
+
+  if (comment.chapter.story.status !== "published" && !canViewDraft) {
+    throw new Error("Truyện chưa được xuất bản.");
+  }
+
+  if (comment.chapter.status !== "published" && !canViewDraft) {
+    throw new Error("Chương chưa được xuất bản.");
+  }
+
+  return comment;
+};
+
+const ensureStoryCanBeReported = async ({ storyId, requester }) => {
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const normalizedStoryId = normalizeText(storyId);
+  if (!normalizedStoryId) throw new Error("Thiếu thông tin truyện.");
+
+  const story = await prisma.story.findUnique({
+    where: { id: normalizedStoryId },
+    select: {
+      id: true,
+      title: true,
+      slug: true,
+      authorId: true,
+      status: true,
+      isHidden: true,
+    },
+  });
+
+  if (!story) throw new Error("Không tìm thấy truyện.");
+
+  const canViewDraft = story.authorId === requester.id || isAdmin(requester);
+  if (story.status !== "published" && !canViewDraft) {
+    throw new Error("Truyện chưa được xuất bản.");
+  }
+  if (story.isHidden) {
+    throw new Error("Truyện đã bị ẩn bởi quản trị viên.");
+  }
+
+  return story;
+};
+
+const ensureChapterCanBeReported = async ({ chapterId, requester }) => {
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const normalizedChapterId = normalizeText(chapterId);
+  if (!normalizedChapterId) throw new Error("Thiếu thông tin chương.");
+
+  const chapter = await prisma.chapter.findUnique({
+    where: { id: normalizedChapterId },
+    include: {
+      story: {
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          authorId: true,
+          status: true,
+          isHidden: true,
+        },
+      },
+    },
+  });
+
+  if (!chapter) throw new Error("Không tìm thấy chương.");
+
+  const canViewDraft = chapter.story.authorId === requester.id || isAdmin(requester);
+  if (chapter.story.status !== "published" && !canViewDraft) {
+    throw new Error("Truyện chưa được xuất bản.");
+  }
+  if (chapter.story.isHidden && !isAdmin(requester) && chapter.story.authorId !== requester.id) {
+    throw new Error("Truyện đã bị ẩn bởi quản trị viên.");
+  }
+  if (chapter.status !== "published" && !canViewDraft) {
+    throw new Error("Chương chưa được xuất bản.");
+  }
+  if (chapter.isHidden) {
+    throw new Error("Chương đã bị ẩn bởi quản trị viên.");
+  }
+
+  return chapter;
+};
+
+const reportChapterComment = async ({ commentId, requester, reason, description }) => {
+  const comment = await ensureChapterCommentCanBeReported({ commentId, requester });
+  if (comment.userId === requester.id) {
+    throw new Error("Cannot report your own comment.");
+  }
+
+  const normalizedReason = validateCommentReportReason(reason);
+  const normalizedDescription = validateCommentReportDescription(description);
+
+  const existingReport = await prisma.chapterCommentReport.findUnique({
+    where: {
+      reporterId_commentId: {
+        reporterId: requester.id,
+        commentId: comment.id,
+      },
+    },
+    select: {
+      id: true,
+      caseId: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+
+  if (existingReport) {
+    if (existingReport.status === "pending") {
+      return {
+        reported: true,
+        already_reported: true,
+        report_id: existingReport.id,
+        status: existingReport.status,
+        created_at: existingReport.createdAt,
+        message: "Báo cáo trước đó đã được ghi nhận.",
+      };
+    }
+
+    const reopenedReport = await prisma.chapterCommentReport.update({
+      where: { id: existingReport.id },
+      data: {
+        reason: normalizedReason,
+        description: normalizedDescription,
+        status: "pending",
+        resolvedAt: null,
+      },
+      select: {
+        id: true,
+        reason: true,
+        status: true,
+        createdAt: true,
+      },
+    });
+    await reopenReportCaseIfNeeded({
+      caseId: existingReport.caseId,
+    });
+    await syncReportCase({
+      type: "chapter_comment",
+      caseId: existingReport.caseId,
+    });
+    await dispatchNotification({
+      recipientId: requester.id,
+      actorId: null,
+      storyId: comment.chapter?.story?.id ?? null,
+      chapterId: comment.chapter?.id ?? null,
+      type: "admin_message",
+      title: "Bên mình đã nhận được báo cáo của bạn",
+      body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+      linkUrl: buildReportTargetLink({
+        type: "chapter_comment",
+        storySlug: comment.chapter?.story?.slug,
+        chapterId: comment.chapter?.id,
+      }),
+      meta: {
+        case_id: existingReport.caseId,
+        audience: "reporter",
+        report_type: "chapter_comment",
+        resolution_action: "report_submitted",
+      },
+    });
+    scheduleReportCaseAiAnalysis({
+      type: "chapter_comment",
+      caseId: existingReport.caseId,
+      recipientId: requester.id,
+      storyId: comment.chapter?.story?.id ?? null,
+      chapterId: comment.chapter?.id ?? null,
+      storySlug: comment.chapter?.story?.slug ?? null,
+    });
+
+    return {
+      reported: true,
+      already_reported: false,
+      report_id: reopenedReport.id,
+      reason: reopenedReport.reason,
+      status: reopenedReport.status,
+      created_at: reopenedReport.createdAt,
+      message: "Chúng tôi đã mở lại báo cáo bình luận của bạn.",
+    };
+  }
+
+  const reportCase = await ensureReportCase({
+    type: "chapter_comment",
+    targetId: comment.id,
+  });
+
+  const report = await prisma.chapterCommentReport.create({
+    data: {
+      caseId: reportCase.id,
+      reporterId: requester.id,
+      commentId: comment.id,
+      reason: normalizedReason,
+      description: normalizedDescription,
+      status: "pending",
+    },
+    select: {
+      id: true,
+      reason: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+  await reopenReportCaseIfNeeded({
+    caseId: reportCase.id,
+  });
+  await syncReportCase({
+    type: "chapter_comment",
+    caseId: reportCase.id,
+  });
+  await dispatchNotification({
+    recipientId: requester.id,
+    actorId: null,
+    storyId: comment.chapter?.story?.id ?? null,
+    chapterId: comment.chapter?.id ?? null,
+    type: "admin_message",
+    title: "Bên mình đã nhận được báo cáo của bạn",
+    body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+    linkUrl: buildReportTargetLink({
+      type: "chapter_comment",
+      storySlug: comment.chapter?.story?.slug,
+      chapterId: comment.chapter?.id,
+    }),
+    meta: {
+      case_id: reportCase.id,
+      audience: "reporter",
+      report_type: "chapter_comment",
+      resolution_action: "report_submitted",
+    },
+  });
+  scheduleReportCaseAiAnalysis({
+    type: "chapter_comment",
+    caseId: reportCase.id,
+    recipientId: requester.id,
+    storyId: comment.chapter?.story?.id ?? null,
+    chapterId: comment.chapter?.id ?? null,
+    storySlug: comment.chapter?.story?.slug ?? null,
+  });
+
+  return {
+    reported: true,
+    already_reported: false,
+    report_id: report.id,
+    reason: report.reason,
+    status: report.status,
+    created_at: report.createdAt,
+    message: "Đã gửi báo cáo bình luận. Cảm ơn bạn đã góp phần giữ cộng đồng an toàn.",
+  };
+};
+
+const reportStory = async ({ storyId, requester, reason, description }) => {
+  const story = await ensureStoryCanBeReported({ storyId, requester });
+  if (story.authorId === requester.id) {
+    throw new Error("Cannot report your own story.");
+  }
+
+  const normalizedReason = validateContentReportReason(reason);
+  const normalizedDescription = validateContentReportDescription(description);
+
+  const existingReport = await prisma.storyReport.findUnique({
+    where: {
+      reporterId_storyId: {
+        reporterId: requester.id,
+        storyId: story.id,
+      },
+    },
+    select: {
+      id: true,
+      caseId: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+
+  if (existingReport) {
+    if (existingReport.status === "pending") {
+      return {
+        reported: true,
+        already_reported: true,
+        report_id: existingReport.id,
+        status: existingReport.status,
+        created_at: existingReport.createdAt,
+        message: "Báo cáo trước đó đã được ghi nhận.",
+      };
+    }
+
+    const reopenedReport = await prisma.storyReport.update({
+      where: { id: existingReport.id },
+      data: {
+        reason: normalizedReason,
+        description: normalizedDescription,
+        status: "pending",
+        resolvedAt: null,
+      },
+      select: {
+        id: true,
+        reason: true,
+        status: true,
+        createdAt: true,
+      },
+    });
+    await reopenReportCaseIfNeeded({
+      caseId: existingReport.caseId,
+    });
+    await syncReportCase({
+      type: "story",
+      caseId: existingReport.caseId,
+    });
+    await dispatchNotification({
+      recipientId: requester.id,
+      actorId: null,
+      storyId: story.id,
+      chapterId: null,
+      type: "admin_message",
+      title: "Bên mình đã nhận được báo cáo của bạn",
+      body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+      linkUrl: buildReportTargetLink({
+        type: "story",
+        storySlug: story.slug,
+        chapterId: null,
+      }),
+      meta: {
+        case_id: existingReport.caseId,
+        audience: "reporter",
+        report_type: "story",
+        resolution_action: "report_submitted",
+      },
+    });
+    scheduleReportCaseAiAnalysis({
+      type: "story",
+      caseId: existingReport.caseId,
+      recipientId: requester.id,
+      storyId: story.id,
+      chapterId: null,
+      storySlug: story.slug ?? null,
+    });
+
+    return {
+      reported: true,
+      already_reported: false,
+      report_id: reopenedReport.id,
+      reason: reopenedReport.reason,
+      status: reopenedReport.status,
+      created_at: reopenedReport.createdAt,
+      message: "Chúng tôi đã mở lại báo cáo truyện của bạn.",
+    };
+  }
+
+  const reportCase = await ensureReportCase({
+    type: "story",
+    targetId: story.id,
+  });
+
+  const report = await prisma.storyReport.create({
+    data: {
+      caseId: reportCase.id,
+      reporterId: requester.id,
+      storyId: story.id,
+      reason: normalizedReason,
+      description: normalizedDescription,
+      status: "pending",
+    },
+    select: {
+      id: true,
+      reason: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+  await reopenReportCaseIfNeeded({
+    caseId: reportCase.id,
+  });
+  await syncReportCase({
+    type: "story",
+    caseId: reportCase.id,
+  });
+  await dispatchNotification({
+    recipientId: requester.id,
+    actorId: null,
+    storyId: story.id,
+    chapterId: null,
+    type: "admin_message",
+    title: "Bên mình đã nhận được báo cáo của bạn",
+    body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+    linkUrl: buildReportTargetLink({
+      type: "story",
+      storySlug: story.slug,
+      chapterId: null,
+    }),
+    meta: {
+      case_id: reportCase.id,
+      audience: "reporter",
+      report_type: "story",
+      resolution_action: "report_submitted",
+    },
+  });
+  scheduleReportCaseAiAnalysis({
+    type: "story",
+    caseId: reportCase.id,
+    recipientId: requester.id,
+    storyId: story.id,
+    chapterId: null,
+    storySlug: story.slug ?? null,
+  });
+
+  return {
+    reported: true,
+    already_reported: false,
+    report_id: report.id,
+    reason: report.reason,
+    status: report.status,
+    created_at: report.createdAt,
+    message: "Đã gửi báo cáo truyện. Cảm ơn bạn đã góp phần giữ cộng đồng an toàn.",
+  };
+};
+
+const reportChapter = async ({ chapterId, requester, reason, description }) => {
+  const chapter = await ensureChapterCanBeReported({ chapterId, requester });
+  if (chapter.story.authorId === requester.id) {
+    throw new Error("Cannot report your own chapter.");
+  }
+
+  const normalizedReason = validateContentReportReason(reason);
+  const normalizedDescription = validateContentReportDescription(description);
+
+  const existingReport = await prisma.chapterReport.findUnique({
+    where: {
+      reporterId_chapterId: {
+        reporterId: requester.id,
+        chapterId: chapter.id,
+      },
+    },
+    select: {
+      id: true,
+      caseId: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+
+  if (existingReport) {
+    if (existingReport.status === "pending") {
+      return {
+        reported: true,
+        already_reported: true,
+        report_id: existingReport.id,
+        status: existingReport.status,
+        created_at: existingReport.createdAt,
+        message: "Báo cáo trước đó đã được ghi nhận.",
+      };
+    }
+
+    const reopenedReport = await prisma.chapterReport.update({
+      where: { id: existingReport.id },
+      data: {
+        reason: normalizedReason,
+        description: normalizedDescription,
+        status: "pending",
+        resolvedAt: null,
+      },
+      select: {
+        id: true,
+        reason: true,
+        status: true,
+        createdAt: true,
+      },
+    });
+    await reopenReportCaseIfNeeded({
+      caseId: existingReport.caseId,
+    });
+    await syncReportCase({
+      type: "chapter",
+      caseId: existingReport.caseId,
+    });
+    await dispatchNotification({
+      recipientId: requester.id,
+      actorId: null,
+      storyId: chapter.story?.id ?? null,
+      chapterId: chapter.id,
+      type: "admin_message",
+      title: "Bên mình đã nhận được báo cáo của bạn",
+      body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+      linkUrl: buildReportTargetLink({
+        type: "chapter",
+        storySlug: chapter.story?.slug,
+        chapterId: chapter.id,
+      }),
+      meta: {
+        case_id: existingReport.caseId,
+        audience: "reporter",
+        report_type: "chapter",
+        resolution_action: "report_submitted",
+      },
+    });
+    scheduleReportCaseAiAnalysis({
+      type: "chapter",
+      caseId: existingReport.caseId,
+      recipientId: requester.id,
+      storyId: chapter.story?.id ?? null,
+      chapterId: chapter.id,
+      storySlug: chapter.story?.slug ?? null,
+    });
+
+    return {
+      reported: true,
+      already_reported: false,
+      report_id: reopenedReport.id,
+      reason: reopenedReport.reason,
+      status: reopenedReport.status,
+      created_at: reopenedReport.createdAt,
+      message: "Chúng tôi đã mở lại báo cáo chương của bạn.",
+    };
+  }
+
+  const reportCase = await ensureReportCase({
+    type: "chapter",
+    targetId: chapter.id,
+  });
+
+  const report = await prisma.chapterReport.create({
+    data: {
+      caseId: reportCase.id,
+      reporterId: requester.id,
+      chapterId: chapter.id,
+      reason: normalizedReason,
+      description: normalizedDescription,
+      status: "pending",
+    },
+    select: {
+      id: true,
+      reason: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+  await reopenReportCaseIfNeeded({
+    caseId: reportCase.id,
+  });
+  await syncReportCase({
+    type: "chapter",
+    caseId: reportCase.id,
+  });
+  await dispatchNotification({
+    recipientId: requester.id,
+    actorId: null,
+    storyId: chapter.story?.id ?? null,
+    chapterId: chapter.id,
+    type: "admin_message",
+    title: "Bên mình đã nhận được báo cáo của bạn",
+    body: "Đội ngũ đang xem xét báo cáo. Bên mình sẽ gửi kết quả cho bạn sớm.",
+    linkUrl: buildReportTargetLink({
+      type: "chapter",
+      storySlug: chapter.story?.slug,
+      chapterId: chapter.id,
+    }),
+    meta: {
+      case_id: reportCase.id,
+      audience: "reporter",
+      report_type: "chapter",
+      resolution_action: "report_submitted",
+    },
+  });
+  scheduleReportCaseAiAnalysis({
+    type: "chapter",
+    caseId: reportCase.id,
+    recipientId: requester.id,
+    storyId: chapter.story?.id ?? null,
+    chapterId: chapter.id,
+    storySlug: chapter.story?.slug ?? null,
+  });
+
+  return {
+    reported: true,
+    already_reported: false,
+    report_id: report.id,
+    reason: report.reason,
+    status: report.status,
+    created_at: report.createdAt,
+    message: "Đã gửi báo cáo chương. Cảm ơn bạn đã góp phần giữ cộng đồng an toàn.",
+  };
+};
+
+const listAdminReports = async ({ type, status, page, limit }) => {
+  const normalizedType = normalizeText(type).toLowerCase();
+  const resolvedPage = parsePositiveInteger(page, 1);
+  const resolvedLimit = Math.min(parsePositiveInteger(limit, 20), 100);
+  const reportTypes = normalizedType
+    ? [validateAdminReportType(normalizedType)]
+    : ["story", "chapter", "chapter_comment"];
+
+  const normalizedStatus = normalizeText(status).toLowerCase();
+  const items = [];
+
+  for (const reportType of reportTypes) {
+    const validatedStatus = validateAdminReportStatus({
+      type: reportType,
+      status: normalizedStatus,
+    });
+    const delegate = getAdminReportDelegate(reportType);
+    const reports = await delegate.findMany({
+      where: validatedStatus ? { status: validatedStatus } : undefined,
+      include: getAdminReportInclude(reportType),
+      orderBy: { createdAt: "desc" },
+    });
+
+    items.push(
+      ...reports.map((report) =>
+        buildReportSummary({ type: reportType, report }),
+      ),
+    );
+  }
+
+  items.sort(
+    (a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+  );
+
+  const total = items.length;
+  const start = (resolvedPage - 1) * resolvedLimit;
+  const pagedItems = items.slice(start, start + resolvedLimit);
+
+  return {
+    items: pagedItems,
+    pagination: {
+      page: resolvedPage,
+      limit: resolvedLimit,
+      total,
+      total_pages: Math.max(1, Math.ceil(total / resolvedLimit)),
+    },
+  };
+};
+
+const getAdminReportDetail = async ({ type, reportId }) => {
+  const normalizedType = validateAdminReportType(type);
+  const normalizedReportId = normalizeText(reportId);
+  if (!normalizedReportId) throw new Error("Thiếu thông tin báo cáo.");
+
+  const delegate = getAdminReportDelegate(normalizedType);
+  const report = await delegate.findUnique({
+    where: { id: normalizedReportId },
+    include: getAdminReportInclude(normalizedType),
+  });
+
+  if (!report) throw new Error("Không tìm thấy báo cáo.");
+
+  return buildReportSummary({ type: normalizedType, report });
+};
+
+const updateChapterCommentModeration = async ({
+  reportId,
+  status,
+  requester,
+}) => {
+  const now = new Date();
+  let shouldRecomputeFeatured = false;
+
+  const transactionResult = await prisma.$transaction(async (tx) => {
+    const existingReport = await tx.chapterCommentReport.findUnique({
+      where: { id: reportId },
+      select: {
+        id: true,
+        caseId: true,
+        reason: true,
+        reporter: {
+          select: { id: true, displayName: true, email: true },
+        },
+        comment: {
+          select: {
+            id: true,
+            content: true,
+            isHidden: true,
+            userId: true,
+            chapterId: true,
+            chapter: {
+              select: {
+                id: true,
+                chapterNumber: true,
+                title: true,
+                story: {
+                  select: {
+                    id: true,
+                    title: true,
+                    slug: true,
+                  },
+                },
+              },
+            },
+            user: {
+              select: { id: true, displayName: true, email: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!existingReport) throw new Error("Không tìm thấy báo cáo.");
+
+    let ownerNotified = false;
+
+    if (status === "removed" && !existingReport.comment.isHidden) {
+      await tx.chapterComment.update({
+        where: { id: existingReport.comment.id },
+        data: {
+          isHidden: true,
+          hiddenAt: now,
+          hiddenById: requester.id,
+          hiddenReason: `report:${existingReport.reason}`,
+        },
+      });
+
+      const currentStats = await tx.chapterStat.findUnique({
+        where: { chapterId: existingReport.comment.chapterId },
+        select: { commentCount: true },
+      });
+
+      if (currentStats) {
+        await tx.chapterStat.update({
+          where: { chapterId: existingReport.comment.chapterId },
+          data: {
+            commentCount: Math.max(0, currentStats.commentCount - 1),
+          },
+        });
+      }
+
+      ownerNotified = true;
+      shouldRecomputeFeatured = true;
+    }
+
+    await tx.chapterCommentReport.update({
+      where: { id: reportId },
+      data: {
+        status,
+        resolvedAt: status === "pending" ? null : now,
+      },
+    });
+    await syncReportCase({
+      db: tx,
+      type: "chapter_comment",
+      caseId: existingReport.caseId,
+    });
+    const report = await tx.chapterCommentReport.findUnique({
+      where: { id: reportId },
+      include: getAdminReportInclude("chapter_comment"),
+    });
+
+    return {
+      report,
+      caseId: existingReport.caseId,
+      ownerNotified,
+      reporter: existingReport.reporter,
+      comment: existingReport.comment,
+    };
+  }, { timeout: 15000, maxWait: 10000 });
+
+  const { report, caseId, ownerNotified, reporter, comment } = transactionResult;
+  const chapter = comment.chapter;
+  const story = chapter?.story;
+  const linkUrl =
+    story?.slug && chapter?.id
+      ? `/stories/${story.slug}/chapters/${chapter.id}`
+      : null;
+
+  if (shouldRecomputeFeatured && chapter?.id) {
+    await recomputeChapterFeaturedComment({
+      chapterId: chapter.id,
+    });
+  }
+
+  await dispatchAiAnalyze({
+    type: "chapter_comment",
+    caseId,
+  });
+
+  if (status !== "pending" && reporter?.id) {
+    await dispatchNotification({
+      recipientId: reporter.id,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      chapterId: chapter?.id ?? null,
+      type: "admin_message",
+      title:
+        status === "removed"
+          ? "Báo cáo bình luận của bạn đã được xử lý"
+          : "Báo cáo bình luận của bạn đã được xem xét",
+      body:
+        status === "removed"
+          ? "Quản trị viên đã gỡ bình luận bị báo cáo."
+          : "Quản trị viên đã xem xét nhưng chưa gỡ bình luận này.",
+      linkUrl,
+      meta: {
+        audience: "reporter",
+        report_id: report.id,
+        report_type: "chapter_comment",
+        report_status: status,
+        resolution_action: status === "removed" ? "comment_removed" : "ignored",
+        target_type: "chapter_comment",
+        comment_id: comment.id,
+        chapter_id: chapter?.id ?? null,
+        chapter_number: chapter?.chapterNumber ?? null,
+        chapter_title: chapter?.title ?? null,
+        story_title: story?.title ?? null,
+      },
+    });
+  }
+
+  if (status === "removed" && comment.userId !== requester.id) {
+    await dispatchNotification({
+      recipientId: comment.userId,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      chapterId: chapter?.id ?? null,
+      type: "admin_message",
+      title: "Bình luận của bạn đã được gỡ sau khi xử lý",
+      body: "Quản trị viên đã gỡ bình luận của bạn sau khi xem xét báo cáo.",
+      linkUrl,
+      meta: {
+        audience: "owner",
+        case_id: caseId,
+        report_type: "chapter_comment",
+        resolution_action: "comment_removed",
+        target_type: "chapter_comment",
+        comment_id: comment.id,
+        chapter_id: chapter?.id ?? null,
+        chapter_number: chapter?.chapterNumber ?? null,
+        chapter_title: chapter?.title ?? null,
+        story_title: story?.title ?? null,
+        moderated_by: getRequesterDisplayName(requester),
+      },
+    });
+  }
+
+  const refreshedReport = await prisma.chapterCommentReport.findUnique({
+    where: { id: report.id },
+    include: getAdminReportInclude("chapter_comment"),
+  });
+
+  return buildReportSummary({
+    type: "chapter_comment",
+    report: refreshedReport || report,
+  });
+};
+
+const updateChapterModeration = async ({
+  reportId,
+  status,
+  requester,
+}) => {
+  const now = new Date();
+
+  const transactionResult = await prisma.$transaction(async (tx) => {
+    const existingReport = await tx.chapterReport.findUnique({
+      where: { id: reportId },
+      select: {
+        id: true,
+        caseId: true,
+        reason: true,
+        reporter: {
+          select: { id: true, displayName: true, email: true },
+        },
+        chapter: {
+          select: {
+            id: true,
+            chapterNumber: true,
+            title: true,
+            status: true,
+            isHidden: true,
+            storyId: true,
+            story: {
+              select: {
+                id: true,
+                title: true,
+                slug: true,
+                authorId: true,
+                author: {
+                  select: { id: true, displayName: true, email: true },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!existingReport) throw new Error("Không tìm thấy báo cáo.");
+
+    let ownerNotified = false;
+
+    if (status === "action_taken" && !existingReport.chapter.isHidden) {
+      await tx.chapter.update({
+        where: { id: existingReport.chapter.id },
+        data: {
+          isHidden: true,
+          hiddenAt: now,
+          hiddenById: requester.id,
+          hiddenReason: `report:${existingReport.reason}`,
+        },
+      });
+      ownerNotified = true;
+    }
+
+    await tx.chapterReport.update({
+      where: { id: reportId },
+      data: {
+        status,
+        resolvedAt: status === "pending" ? null : now,
+      },
+    });
+    await syncReportCase({
+      db: tx,
+      type: "chapter",
+      caseId: existingReport.caseId,
+    });
+    const report = await tx.chapterReport.findUnique({
+      where: { id: reportId },
+      include: getAdminReportInclude("chapter"),
+    });
+
+    return {
+      report,
+      caseId: existingReport.caseId,
+      reporter: existingReport.reporter,
+      chapter: existingReport.chapter,
+      ownerNotified,
+    };
+  }, { timeout: 15000, maxWait: 10000 });
+
+  const { report, caseId, reporter, chapter, ownerNotified } = transactionResult;
+  const story = chapter.story;
+  const linkUrl =
+    story?.slug && chapter?.id
+      ? `/stories/${story.slug}/chapters/${chapter.id}`
+      : null;
+
+  if (status !== "pending" && reporter?.id) {
+    await dispatchNotification({
+      recipientId: reporter.id,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      chapterId: chapter?.id ?? null,
+      type: "admin_message",
+      title:
+        status === "action_taken"
+          ? "Báo cáo chương của bạn đã được xử lý"
+          : "Báo cáo chương của bạn đã được xem xét",
+      body:
+        status === "action_taken"
+          ? "Quản trị viên đã ẩn chương bị báo cáo."
+          : "Quản trị viên đã xem xét nhưng chưa ẩn chương này.",
+      linkUrl,
+      meta: {
+        audience: "reporter",
+        report_id: report.id,
+        report_type: "chapter",
+        report_status: status,
+        resolution_action: status === "action_taken" ? "chapter_hidden" : "ignored",
+        target_type: "chapter",
+        chapter_id: chapter.id,
+        chapter_number: chapter.chapterNumber,
+        chapter_title: chapter.title,
+        story_title: story?.title ?? null,
+      },
+    });
+  }
+
+  if (status === "action_taken" && chapter.story.authorId !== requester.id) {
+    await dispatchNotification({
+      recipientId: chapter.story.authorId,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      chapterId: chapter?.id ?? null,
+      type: "admin_message",
+      title: "Chương của bạn đã được tạm ẩn",
+      body: "Quản trị viên đã ẩn chương của bạn sau khi xem xét báo cáo.",
+      linkUrl,
+      meta: {
+        audience: "owner",
+        case_id: caseId,
+        report_type: "chapter",
+        resolution_action: "chapter_hidden",
+        target_type: "chapter",
+        chapter_id: chapter.id,
+        chapter_number: chapter.chapterNumber,
+        chapter_title: chapter.title,
+        story_title: story?.title ?? null,
+        moderated_by: getRequesterDisplayName(requester),
+      },
+    });
+  }
+
+  await dispatchAiAnalyze({
+    type: "chapter",
+    caseId,
+  });
+
+  const refreshedReport = await prisma.chapterReport.findUnique({
+    where: { id: report.id },
+    include: getAdminReportInclude("chapter"),
+  });
+
+  return buildReportSummary({
+    type: "chapter",
+    report: refreshedReport || report,
+  });
+};
+
+const updateStoryModeration = async ({
+  reportId,
+  status,
+  requester,
+}) => {
+  const now = new Date();
+
+  const transactionResult = await prisma.$transaction(async (tx) => {
+    const existingReport = await tx.storyReport.findUnique({
+      where: { id: reportId },
+      select: {
+        id: true,
+        caseId: true,
+        reason: true,
+        reporter: {
+          select: { id: true, displayName: true, email: true },
+        },
+        story: {
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            status: true,
+            isHidden: true,
+            authorId: true,
+            author: {
+              select: { id: true, displayName: true, email: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!existingReport) throw new Error("Không tìm thấy báo cáo.");
+
+    let ownerNotified = false;
+
+    if (status === "action_taken" && !existingReport.story.isHidden) {
+      await tx.story.update({
+        where: { id: existingReport.story.id },
+        data: {
+          isHidden: true,
+          hiddenAt: now,
+          hiddenById: requester.id,
+          hiddenReason: `report:${existingReport.reason}`,
+        },
+      });
+      ownerNotified = true;
+    }
+
+    await tx.storyReport.update({
+      where: { id: reportId },
+      data: {
+        status,
+        resolvedAt: status === "pending" ? null : now,
+      },
+    });
+    await syncReportCase({
+      db: tx,
+      type: "story",
+      caseId: existingReport.caseId,
+    });
+    const report = await tx.storyReport.findUnique({
+      where: { id: reportId },
+      include: getAdminReportInclude("story"),
+    });
+
+    return {
+      report,
+      caseId: existingReport.caseId,
+      reporter: existingReport.reporter,
+      story: existingReport.story,
+      ownerNotified,
+    };
+  }, { timeout: 15000, maxWait: 10000 });
+
+  const { report, caseId, reporter, story, ownerNotified } = transactionResult;
+  const linkUrl = story?.slug ? `/stories/${story.slug}` : null;
+
+  if (status !== "pending" && reporter?.id) {
+    await dispatchNotification({
+      recipientId: reporter.id,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      type: "admin_message",
+      title:
+        status === "action_taken"
+          ? "Báo cáo truyện của bạn đã được xử lý"
+          : "Báo cáo truyện của bạn đã được xem xét",
+      body:
+        status === "action_taken"
+          ? "Quản trị viên đã ẩn truyện bị báo cáo."
+          : "Quản trị viên đã xem xét nhưng chưa ẩn truyện này.",
+      linkUrl,
+      meta: {
+        audience: "reporter",
+        report_id: report.id,
+        report_type: "story",
+        report_status: status,
+        resolution_action: status === "action_taken" ? "story_hidden" : "ignored",
+        target_type: "story",
+        story_id: story.id,
+        story_title: story.title,
+      },
+    });
+  }
+
+  if (status === "action_taken" && story.authorId !== requester.id) {
+    await dispatchNotification({
+      recipientId: story.authorId,
+      actorId: requester.id,
+      storyId: story?.id ?? null,
+      type: "admin_message",
+      title: "Truyện của bạn đã được tạm ẩn",
+      body: "Quản trị viên đã ẩn truyện của bạn sau khi xem xét báo cáo.",
+      linkUrl,
+      meta: {
+        audience: "owner",
+        case_id: caseId,
+        report_type: "story",
+        resolution_action: "story_hidden",
+        target_type: "story",
+        story_id: story.id,
+        story_title: story.title,
+        moderated_by: getRequesterDisplayName(requester),
+      },
+    });
+  }
+
+  await dispatchAiAnalyze({
+    type: "story",
+    caseId,
+  });
+
+  const refreshedReport = await prisma.storyReport.findUnique({
+    where: { id: report.id },
+    include: getAdminReportInclude("story"),
+  });
+
+  return buildReportSummary({
+    type: "story",
+    report: refreshedReport || report,
+  });
+};
+
+const updateAdminReportStatus = async ({ type, reportId, status, requester }) => {
+  const normalizedType = validateAdminReportType(type);
+  const normalizedReportId = normalizeText(reportId);
+  if (!normalizedReportId) throw new Error("Thiếu thông tin báo cáo.");
+
+  const normalizedStatus = validateAdminReportStatus({
+    type: normalizedType,
+    status,
+  });
+  if (!normalizedStatus) throw new Error("Thiếu trạng thái báo cáo.");
+
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  if (normalizedType === "chapter_comment") {
+    return updateChapterCommentModeration({
+      reportId: normalizedReportId,
+      status: normalizedStatus,
+      requester,
+    });
+  }
+  if (normalizedType === "chapter") {
+    return updateChapterModeration({
+      reportId: normalizedReportId,
+      status: normalizedStatus,
+      requester,
+    });
+  }
+  if (normalizedType === "story") {
+    return updateStoryModeration({
+      reportId: normalizedReportId,
+      status: normalizedStatus,
+      requester,
+    });
+  }
+
+  const delegate = getAdminReportDelegate(normalizedType);
+  const existingReport = await delegate.findUnique({
+    where: { id: normalizedReportId },
+    select: { id: true },
+  });
+  if (!existingReport) throw new Error("Không tìm thấy báo cáo.");
+
+  const report = await delegate.update({
+    where: { id: normalizedReportId },
+    data: {
+      status: normalizedStatus,
+      resolvedAt: normalizedStatus === "pending" ? null : new Date(),
+    },
+    include: getAdminReportInclude(normalizedType),
+  });
+
+  return buildReportSummary({ type: normalizedType, report });
+};
+
+const getCriticalCaseReportIds = (reportCase) => {
+  if (reportCase.targetType === "chapter_comment") {
+    return reportCase.chapterCommentReports.map((report) => report.id);
+  }
+  if (reportCase.targetType === "chapter") {
+    return reportCase.chapterReports.map((report) => report.id);
+  }
+  return reportCase.storyReports.map((report) => report.id);
+};
+
+const getDefaultActionStatusForType = (type) =>
+  type === "chapter_comment" ? "removed" : "action_taken";
+
+const CRITICAL_BATCH_LIMIT = 50;
+const CRITICAL_BATCH_CONCURRENCY = 5;
+
+const processCriticalAdminReportCases = async ({
+  requester,
+  lockAuthor = false,
+  lockReason = "",
+}) => {
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const trimmedLockReason = normalizeText(lockReason);
+  if (lockAuthor && !trimmedLockReason) {
+    throw new Error("Vui lòng nhập lý do khóa khi chọn khóa luôn người đăng.");
+  }
+
+  const [totalCriticalPending, criticalCases] = await Promise.all([
+    prisma.reportCase.count({
+      where: { status: "pending", priority: "critical" },
+    }),
+    prisma.reportCase.findMany({
+      where: { status: "pending", priority: "critical" },
+      orderBy: [{ riskScore: "desc" }, { lastReportedAt: "asc" }],
+      take: CRITICAL_BATCH_LIMIT,
+      include: {
+        storyReports: { where: { status: "pending" }, select: { id: true } },
+        chapterReports: { where: { status: "pending" }, select: { id: true } },
+        chapterCommentReports: {
+          where: { status: "pending" },
+          select: { id: true },
+        },
+      },
+    }),
+  ]);
+
+  const processedItems = [];
+  const errors = [];
+  let processedReportCount = 0;
+  let lockedAuthorCount = 0;
+
+  const processOneCase = async (reportCase) => {
+    const reportIds = getCriticalCaseReportIds(reportCase);
+    if (!reportIds.length) return;
+
+    try {
+      let latestItem = null;
+      for (const reportId of reportIds) {
+        latestItem = await updateAdminReportStatus({
+          type: reportCase.targetType,
+          reportId,
+          status: getDefaultActionStatusForType(reportCase.targetType),
+          requester,
+        });
+        processedReportCount += 1;
+      }
+      if (latestItem) processedItems.push(latestItem);
+
+      if (lockAuthor && !reportCase.accountLockApplied) {
+        try {
+          await lockReportCaseAuthor({
+            caseId: reportCase.id,
+            requester,
+            reason: trimmedLockReason,
+            lockedUntil: null,
+            alsoResolveContent: false,
+          });
+          lockedAuthorCount += 1;
+        } catch (lockError) {
+          errors.push({
+            case_id: reportCase.id,
+            target_type: reportCase.targetType,
+            message: `Khóa tác giả thất bại: ${
+              lockError instanceof Error ? lockError.message : "Unknown error"
+            }`,
+          });
+        }
+      }
+    } catch (error) {
+      errors.push({
+        case_id: reportCase.id,
+        target_type: reportCase.targetType,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to process critical report case.",
+      });
+    }
+  };
+
+  for (let i = 0; i < criticalCases.length; i += CRITICAL_BATCH_CONCURRENCY) {
+    const chunk = criticalCases.slice(i, i + CRITICAL_BATCH_CONCURRENCY);
+    await Promise.allSettled(chunk.map(processOneCase));
+  }
+
+  const remainingCriticalCount = Math.max(
+    0,
+    totalCriticalPending - processedItems.length - errors.length,
+  );
+
+  return {
+    processed_case_count: processedItems.length,
+    processed_report_count: processedReportCount,
+    locked_author_count: lockedAuthorCount,
+    failed_case_count: errors.length,
+    remaining_critical_count: remainingCriticalCount,
+    batch_limit: CRITICAL_BATCH_LIMIT,
+    errors,
+    items: processedItems,
+  };
+};
+
+const RESTORABLE_RESOLUTION_ACTIONS = new Set([
+  "comment_removed",
+  "chapter_hidden",
+  "story_hidden",
+]);
+
+const validateAppealReason = (reason) => {
+  const normalizedReason = normalizeText(reason);
+  if (normalizedReason.length < 20) {
+    throw new Error("Vui lòng nhập lý do kháng nghị ít nhất 20 ký tự.");
+  }
+  if (normalizedReason.length > 1000) {
+    throw new Error("Lý do kháng nghị tối đa 1000 ký tự.");
+  }
+  return normalizedReason;
+};
+
+const getRestorableTargetType = (resolutionAction) => {
+  if (resolutionAction === "comment_removed") return "chapter_comment";
+  if (resolutionAction === "chapter_hidden") return "chapter";
+  if (resolutionAction === "story_hidden") return "story";
+  return null;
+};
+
+const getReportCaseOwnerContext = async ({ db = prisma, reportCase }) => {
+  if (reportCase.targetType === "chapter_comment") {
+    const comment = await db.chapterComment.findUnique({
+      where: { id: reportCase.targetId },
+      select: {
+        id: true,
+        content: true,
+        userId: true,
+        isHidden: true,
+        chapterId: true,
+        chapter: {
+          select: {
+            id: true,
+            chapterNumber: true,
+            title: true,
+            story: {
+              select: {
+                id: true,
+                title: true,
+                slug: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    if (!comment) throw new Error("Không tìm thấy bình luận.");
+    return {
+      ownerId: comment.userId,
+      isHidden: comment.isHidden,
+      storyId: comment.chapter?.story?.id ?? null,
+      chapterId: comment.chapterId,
+      title: "Khiếu nại bình luận đã được tiếp nhận",
+      body: "Đội ngũ đang xem xét và sẽ gửi kết quả cho bạn sớm.",
+      linkUrl:
+        comment.chapter?.story?.slug && comment.chapter?.id
+          ? `/stories/${comment.chapter.story.slug}/chapters/${comment.chapter.id}`
+          : null,
+      meta: {
+        case_id: reportCase.id,
+        audience: "owner",
+        report_type: "chapter_comment",
+        resolution_action: "appeal_submitted",
+        target_type: "chapter_comment",
+        comment_id: comment.id,
+        comment_preview: String(comment.content || "").slice(0, 120),
+        chapter_id: comment.chapterId,
+        chapter_number: comment.chapter?.chapterNumber ?? null,
+        chapter_title: comment.chapter?.title ?? null,
+        story_title: comment.chapter?.story?.title ?? null,
+      },
+    };
+  }
+
+  if (reportCase.targetType === "chapter") {
+    const chapter = await db.chapter.findUnique({
+      where: { id: reportCase.targetId },
+      select: {
+        id: true,
+        chapterNumber: true,
+        title: true,
+        isHidden: true,
+        story: {
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            authorId: true,
+          },
+        },
+      },
+    });
+    if (!chapter) throw new Error("Không tìm thấy chương.");
+    return {
+      ownerId: chapter.story?.authorId ?? null,
+      isHidden: chapter.isHidden,
+      storyId: chapter.story?.id ?? null,
+      chapterId: chapter.id,
+      title: "Khiếu nại chương đã được tiếp nhận",
+      body: "Đội ngũ đang xem xét và sẽ gửi kết quả cho bạn sớm.",
+      linkUrl:
+        chapter.story?.slug && chapter.id
+          ? `/stories/${chapter.story.slug}/chapters/${chapter.id}`
+          : null,
+      meta: {
+        case_id: reportCase.id,
+        audience: "owner",
+        report_type: "chapter",
+        resolution_action: "appeal_submitted",
+        target_type: "chapter",
+        chapter_id: chapter.id,
+        chapter_number: chapter.chapterNumber,
+        chapter_title: chapter.title,
+        story_title: chapter.story?.title ?? null,
+      },
+    };
+  }
+
+  const story = await db.story.findUnique({
+    where: { id: reportCase.targetId },
+    select: {
+      id: true,
+      title: true,
+      slug: true,
+      authorId: true,
+      isHidden: true,
+    },
+  });
+  if (!story) throw new Error("Không tìm thấy truyện.");
+  return {
+    ownerId: story.authorId,
+    isHidden: story.isHidden,
+    storyId: story.id,
+    chapterId: null,
+    title: "Khiếu nại truyện đã được tiếp nhận",
+    body: "Đội ngũ đang xem xét và sẽ gửi kết quả cho bạn sớm.",
+    linkUrl: story.slug ? `/stories/${story.slug}` : null,
+    meta: {
+      case_id: reportCase.id,
+      audience: "owner",
+      report_type: "story",
+      resolution_action: "appeal_submitted",
+      target_type: "story",
+      story_id: story.id,
+      story_title: story.title,
+    },
+  };
+};
+
+const submitReportCaseAppeal = async ({ caseId, requester, reason }) => {
+  const normalizedCaseId = normalizeText(caseId);
+  if (!normalizedCaseId) throw new Error("Thiếu thông tin vụ việc báo cáo.");
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const normalizedReason = validateAppealReason(reason);
+  const now = new Date();
+  let notificationPayload = null;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const reportCase = await tx.reportCase.findUnique({
+      where: { id: normalizedCaseId },
+      select: {
+        id: true,
+        targetType: true,
+        targetId: true,
+        status: true,
+        resolutionAction: true,
+        restoredAt: true,
+        appealStatus: true,
+      },
+    });
+
+    if (!reportCase) throw new Error("Không tìm thấy vụ việc báo cáo.");
+    if (reportCase.status !== "resolved") {
+      throw new Error("Chỉ có thể kháng nghị vụ việc đã được xử lý.");
+    }
+    if (reportCase.restoredAt) {
+      throw new Error("Nội dung này đã được khôi phục rồi.");
+    }
+    if (!RESTORABLE_RESOLUTION_ACTIONS.has(reportCase.resolutionAction)) {
+      throw new Error("Quyết định này không hỗ trợ kháng nghị.");
+    }
+    if (reportCase.appealStatus === "pending") {
+      throw new Error("Bạn đã gửi kháng nghị trước đó và đang chờ xử lý.");
+    }
+    if (reportCase.appealStatus) {
+      throw new Error("Vụ việc này đã có kết quả kháng nghị.");
+    }
+
+    const ownerContext = await getReportCaseOwnerContext({
+      db: tx,
+      reportCase,
+    });
+    if (ownerContext.ownerId !== requester.id) {
+      throw new Error("Bạn không có quyền kháng nghị vụ việc này.");
+    }
+    if (!ownerContext.isHidden) {
+      throw new Error("Nội dung hiện không còn bị ẩn.");
+    }
+
+    const updatedCase = await tx.reportCase.update({
+      where: { id: reportCase.id },
+      data: {
+        appealStatus: "pending",
+        appealReason: normalizedReason,
+        appealSubmittedAt: now,
+        appealResolvedAt: null,
+        appealResolvedById: null,
+        appealAiSummary: null,
+        appealAiRecommendation: null,
+        appealAiConfidence: null,
+        appealAiCheckedAt: null,
+      },
+      select: {
+        id: true,
+        appealStatus: true,
+        appealReason: true,
+        appealSubmittedAt: true,
+      },
+    });
+
+    notificationPayload = ownerContext;
+    return updatedCase;
+  }, { timeout: 15000, maxWait: 10000 });
+
+  if (notificationPayload?.ownerId) {
+    await dispatchNotification({
+      recipientId: notificationPayload.ownerId,
+      actorId: null,
+      storyId: notificationPayload.storyId,
+      chapterId: notificationPayload.chapterId,
+      type: "admin_message",
+      title: notificationPayload.title,
+      body: notificationPayload.body,
+      linkUrl: notificationPayload.linkUrl,
+      meta: notificationPayload.meta,
+    });
+
+    scheduleReportAppealAiAnalysis({
+      caseId: normalizedCaseId,
+      recipientId: notificationPayload.ownerId,
+      storyId: notificationPayload.storyId ?? null,
+      chapterId: notificationPayload.chapterId ?? null,
+      storySlug: notificationPayload.linkUrl?.match(/\/stories\/([^/]+)/)?.[1] ?? null,
+      reportType: notificationPayload.meta?.report_type ?? "story",
+    });
+  }
+
+  return {
+    appealed: true,
+    case_id: result.id,
+    appeal_status: result.appealStatus,
+    appeal_reason: result.appealReason,
+    appeal_submitted_at: result.appealSubmittedAt,
+    message: "Đã gửi kháng nghị. Chúng tôi sẽ xem xét và phản hồi sớm nhất có thể.",
+  };
+};
+
+const restoreAdminReportCase = async ({ caseId, requester, unlockUser = false }) => {
+  const normalizedCaseId = normalizeText(caseId);
+  if (!normalizedCaseId) throw new Error("Thiếu thông tin vụ việc báo cáo.");
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  let shouldRecomputeFeatured = false;
+  let recomputeChapterId = null;
+  let lockedUserToUnlockId = null;
+
+  const transactionResult = await prisma.$transaction(async (tx) => {
+    let notificationPayload = null;
+    const reportCase = await tx.reportCase.findUnique({
+      where: { id: normalizedCaseId },
+      select: {
+        id: true,
+        targetType: true,
+        targetId: true,
+        status: true,
+        resolutionAction: true,
+        restoredAt: true,
+        accountLockApplied: true,
+        accountLockedUserId: true,
+      },
+    });
+
+    if (!reportCase) throw new Error("Không tìm thấy vụ việc báo cáo.");
+    if (reportCase.status !== "resolved") {
+      throw new Error("Chỉ có thể khôi phục vụ việc đã được xử lý.");
+    }
+    if (reportCase.restoredAt) {
+      throw new Error("Vụ việc này đã được khôi phục trước đó.");
+    }
+    if (!RESTORABLE_RESOLUTION_ACTIONS.has(reportCase.resolutionAction)) {
+      throw new Error("Vụ việc này không có nội dung cần khôi phục.");
+    }
+
+    const expectedType = getRestorableTargetType(reportCase.resolutionAction);
+    if (expectedType !== reportCase.targetType) {
+      throw new Error("Thông tin vụ việc không khớp với thao tác khôi phục.");
+    }
+
+    if (reportCase.targetType === "chapter_comment") {
+      const comment = await tx.chapterComment.findUnique({
+        where: { id: reportCase.targetId },
+        select: {
+          id: true,
+          content: true,
+          isHidden: true,
+          chapterId: true,
+          userId: true,
+          moderationStatus: true,
+          chapter: {
+            select: {
+              id: true,
+              chapterNumber: true,
+              title: true,
+              story: {
+                select: {
+                  id: true,
+                  title: true,
+                  slug: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      if (!comment) throw new Error("Không tìm thấy bình luận cần khôi phục.");
+      notificationPayload = {
+        recipientId: comment.userId,
+        storyId: comment.chapter?.story?.id ?? null,
+        chapterId: comment.chapterId,
+        title: "Bình luận của bạn đã được khôi phục",
+        body:
+          "Quản trị viên đã xem xét lại và hiển thị lại bình luận của bạn. Cảm ơn bạn đã kiên nhẫn trong lúc nội dung được rà soát.",
+        linkUrl:
+          comment.chapter?.story?.slug && comment.chapter?.id
+            ? `/stories/${comment.chapter.story.slug}/chapters/${comment.chapter.id}`
+            : null,
+        meta: {
+          case_id: reportCase.id,
+          audience: "owner",
+          report_type: "chapter_comment",
+          resolution_action: "comment_restored",
+          target_type: "chapter_comment",
+          comment_id: comment.id,
+          comment_preview: String(comment.content || "").slice(0, 120),
+          chapter_id: comment.chapterId,
+          chapter_number: comment.chapter?.chapterNumber ?? null,
+          chapter_title: comment.chapter?.title ?? null,
+          story_title: comment.chapter?.story?.title ?? null,
+          moderated_by: getRequesterDisplayName(requester),
+        },
+      };
+
+      if (comment.isHidden || comment.moderationStatus !== "approved") {
+        await tx.chapterComment.update({
+          where: { id: comment.id },
+          data: {
+            isHidden: false,
+            hiddenAt: null,
+            hiddenById: null,
+            hiddenReason: null,
+            moderationStatus: "approved",
+          },
+        });
+
+        const currentStats = await tx.chapterStat.findUnique({
+          where: { chapterId: comment.chapterId },
+          select: { commentCount: true },
+        });
+        await tx.chapterStat.upsert({
+          where: { chapterId: comment.chapterId },
+          create: {
+            chapterId: comment.chapterId,
+            likeCount: 0,
+            commentCount: 1,
+          },
+          update: {
+            commentCount: (currentStats?.commentCount ?? 0) + 1,
+          },
+        });
+        shouldRecomputeFeatured = true;
+        recomputeChapterId = comment.chapterId;
+      }
+    } else if (reportCase.targetType === "chapter") {
+      const chapter = await tx.chapter.findUnique({
+        where: { id: reportCase.targetId },
+        select: {
+          id: true,
+          chapterNumber: true,
+          title: true,
+          story: {
+            select: {
+              id: true,
+              title: true,
+              slug: true,
+              authorId: true,
+            },
+          },
+        },
+      });
+      if (!chapter) throw new Error("Không tìm thấy chương cần khôi phục.");
+      notificationPayload = {
+        recipientId: chapter.story?.authorId ?? null,
+        storyId: chapter.story?.id ?? null,
+        chapterId: chapter.id,
+        title: "Chương của bạn đã được khôi phục",
+        body:
+          "Chương đã hiển thị trở lại sau khi quản trị viên xem xét lại vụ việc.",
+        linkUrl:
+          chapter.story?.slug && chapter.id
+            ? `/stories/${chapter.story.slug}/chapters/${chapter.id}`
+            : null,
+        meta: {
+          case_id: reportCase.id,
+          audience: "owner",
+          report_type: "chapter",
+          resolution_action: "chapter_restored",
+          target_type: "chapter",
+          chapter_id: chapter.id,
+          chapter_number: chapter.chapterNumber,
+          chapter_title: chapter.title,
+          story_title: chapter.story?.title ?? null,
+          moderated_by: getRequesterDisplayName(requester),
+        },
+      };
+
+      await tx.chapter.update({
+        where: { id: chapter.id },
+        data: {
+          isHidden: false,
+          hiddenAt: null,
+          hiddenById: null,
+          hiddenReason: null,
+        },
+      });
+    } else if (reportCase.targetType === "story") {
+      const story = await tx.story.findUnique({
+        where: { id: reportCase.targetId },
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          authorId: true,
+        },
+      });
+      if (!story) throw new Error("Không tìm thấy truyện cần khôi phục.");
+      notificationPayload = {
+        recipientId: story.authorId,
+        storyId: story.id,
+        chapterId: null,
+        title: "Truyện của bạn đã được khôi phục",
+        body:
+          "Truyện đã hiển thị trở lại sau khi quản trị viên xem xét lại vụ việc.",
+        linkUrl: story.slug ? `/stories/${story.slug}` : null,
+        meta: {
+          case_id: reportCase.id,
+          audience: "owner",
+          report_type: "story",
+          resolution_action: "story_restored",
+          target_type: "story",
+          story_id: story.id,
+          story_title: story.title,
+          moderated_by: getRequesterDisplayName(requester),
+        },
+      };
+
+      await tx.story.update({
+        where: { id: story.id },
+        data: {
+          isHidden: false,
+          hiddenAt: null,
+          hiddenById: null,
+          hiddenReason: null,
+        },
+      });
+    }
+
+    await tx.reportCase.update({
+      where: { id: reportCase.id },
+      data: {
+        restoredAt: new Date(),
+        restoredById: requester.id,
+      },
+    });
+
+    if (
+      unlockUser &&
+      reportCase.accountLockApplied &&
+      reportCase.accountLockedUserId &&
+      reportCase.accountLockedUserId !== requester.id
+    ) {
+      const lockedUser = await tx.user.findUnique({
+        where: { id: reportCase.accountLockedUserId },
+        select: { id: true, isLocked: true },
+      });
+      if (lockedUser?.isLocked) {
+        lockedUserToUnlockId = reportCase.accountLockedUserId;
+      }
+    }
+
+    const delegate = getAdminReportDelegate(reportCase.targetType, tx);
+    const report = await delegate.findFirst({
+      where: { caseId: reportCase.id },
+      orderBy: { updatedAt: "desc" },
+      include: getAdminReportInclude(reportCase.targetType),
+    });
+
+    return {
+      type: reportCase.targetType,
+      report,
+      notificationPayload,
+    };
+  }, { timeout: 15000, maxWait: 10000 });
+
+  if (lockedUserToUnlockId) {
+    try {
+      await userService.unlockUser({
+        targetUserId: lockedUserToUnlockId,
+        actorId: requester.id,
+        caseId: normalizedCaseId,
+        action: "unlock_via_appeal",
+      });
+    } catch (unlockError) {
+      console.error(
+        "[restore-case-unlock:error]",
+        JSON.stringify({
+          case_id: normalizedCaseId,
+          user_id: lockedUserToUnlockId,
+          message: unlockError?.message || String(unlockError),
+        }),
+      );
+    }
+  }
+
+  if (shouldRecomputeFeatured && recomputeChapterId) {
+    await recomputeChapterFeaturedComment({ chapterId: recomputeChapterId });
+  }
+
+  if (!transactionResult.report) {
+    throw new Error("Không tìm thấy báo cáo sau khi khôi phục.");
+  }
+
+  if (
+    transactionResult.notificationPayload?.recipientId &&
+    transactionResult.notificationPayload.recipientId !== requester.id
+  ) {
+    await dispatchNotification({
+      ...transactionResult.notificationPayload,
+      actorId: requester.id,
+      type: "admin_message",
+    });
+  }
+
+  return buildReportSummary({
+    type: transactionResult.type,
+    report: transactionResult.report,
+  });
+};
+
+const lockReportCaseAuthor = async ({
+  caseId,
+  requester,
+  reason,
+  lockedUntil,
+  alsoResolveContent = true,
+}) => {
+  const normalizedCaseId = normalizeText(caseId);
+  if (!normalizedCaseId) throw new Error("Thiếu thông tin vụ việc.");
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+
+  const trimmedReason = normalizeText(reason);
+  if (!trimmedReason) throw new Error("Vui lòng nhập lý do khóa tài khoản.");
+
+  const reportCase = await prisma.reportCase.findUnique({
+    where: { id: normalizedCaseId },
+    select: {
+      id: true,
+      targetType: true,
+      targetId: true,
+      status: true,
+      accountLockApplied: true,
+      accountLockedUserId: true,
+    },
+  });
+  if (!reportCase) throw new Error("Không tìm thấy vụ việc báo cáo.");
+  if (reportCase.accountLockApplied) {
+    throw new Error("Người đăng nội dung này đã bị khóa từ vụ việc.");
+  }
+
+  const ownerContext = await getReportCaseOwnerContext({ reportCase });
+  const ownerId = ownerContext.ownerId;
+  if (!ownerId) throw new Error("Không xác định được tác giả của nội dung.");
+  if (ownerId === requester.id) {
+    throw new Error("Bạn không thể tự khóa tài khoản của chính mình.");
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await userService.lockUser({
+      targetUserId: ownerId,
+      actorId: requester.id,
+      reason: trimmedReason,
+      lockedUntil,
+      caseId: normalizedCaseId,
+      tx,
+    });
+    await tx.reportCase.update({
+      where: { id: reportCase.id },
+      data: {
+        accountLockApplied: true,
+        accountLockedUserId: ownerId,
+      },
+    });
+  }, { timeout: 15000, maxWait: 10000 });
+
+  let resolvedCount = 0;
+  if (alsoResolveContent) {
+    const delegate = getAdminReportDelegate(reportCase.targetType);
+    const pendingReports = await delegate.findMany({
+      where: { caseId: reportCase.id, status: "pending" },
+      select: { id: true },
+    });
+    const targetStatus = getDefaultActionStatusForType(reportCase.targetType);
+    for (const report of pendingReports) {
+      try {
+        await updateAdminReportStatus({
+          type: reportCase.targetType,
+          reportId: report.id,
+          status: targetStatus,
+          requester,
+        });
+        resolvedCount += 1;
+      } catch (resolveError) {
+        console.error(
+          "[lock-author-resolve-content:error]",
+          JSON.stringify({
+            case_id: reportCase.id,
+            report_id: report.id,
+            message: resolveError?.message || String(resolveError),
+          }),
+        );
+      }
+    }
+  }
+
+  await dispatchNotification({
+    recipientId: ownerId,
+    actorId: requester.id,
+    storyId: ownerContext.storyId ?? null,
+    chapterId: ownerContext.chapterId ?? null,
+    type: "admin_message",
+    title: "Tài khoản của bạn đã bị khóa",
+    body: `Tài khoản của bạn đã bị khóa do vi phạm chính sách. Lý do: ${trimmedReason}`,
+    linkUrl: ownerContext.linkUrl ?? null,
+    meta: {
+      case_id: reportCase.id,
+      audience: "owner",
+      report_type: reportCase.targetType,
+      resolution_action: "account_locked",
+      target_type: reportCase.targetType,
+      locked_reason: trimmedReason,
+      moderated_by: getRequesterDisplayName(requester),
+    },
+  });
+
+  const refreshedCase = await prisma.reportCase.findUnique({
+    where: { id: reportCase.id },
+    select: {
+      id: true,
+      accountLockApplied: true,
+      accountLockedUserId: true,
+      lockedUser: {
+        select: {
+          id: true,
+          email: true,
+          displayName: true,
+          isLocked: true,
+          lockedAt: true,
+          lockedUntil: true,
+          lockedReason: true,
+        },
+      },
+    },
+  });
+
+  let representative = null;
+  try {
+    representative = await getReportSummaryForCase({
+      type: reportCase.targetType,
+      caseId: reportCase.id,
+    });
+  } catch (_) {
+    representative = null;
+  }
+
+  return {
+    case_id: reportCase.id,
+    account_lock_applied: refreshedCase?.accountLockApplied ?? true,
+    locked_user: refreshedCase?.lockedUser
+      ? {
+          id: refreshedCase.lockedUser.id,
+          email: refreshedCase.lockedUser.email,
+          display_name: refreshedCase.lockedUser.displayName,
+          is_locked: refreshedCase.lockedUser.isLocked,
+          locked_at: refreshedCase.lockedUser.lockedAt,
+          locked_until: refreshedCase.lockedUser.lockedUntil,
+          locked_reason: refreshedCase.lockedUser.lockedReason,
+        }
+      : null,
+    resolved_report_count: resolvedCount,
+    representative,
+  };
+};
+
+const getReportSummaryForCase = async ({ type, caseId }) => {
+  const delegate = getAdminReportDelegate(type);
+  const report = await delegate.findFirst({
+    where: { caseId },
+    orderBy: { updatedAt: "desc" },
+    include: getAdminReportInclude(type),
+  });
+  if (!report) throw new Error("Không tìm thấy báo cáo trong vụ việc.");
+  return buildReportSummary({ type, report });
+};
+
+const resolveReportCaseAppeal = async ({ caseId, action, requester }) => {
+  const normalizedCaseId = normalizeText(caseId);
+  const normalizedAction = normalizeText(action).toLowerCase();
+  if (!normalizedCaseId) throw new Error("Thiếu thông tin vụ việc báo cáo.");
+  if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
+  if (!["accept", "dismiss"].includes(normalizedAction)) {
+    throw new Error("Thao tác kháng nghị không hợp lệ.");
+  }
+
+  const reportCase = await prisma.reportCase.findUnique({
+    where: { id: normalizedCaseId },
+    select: {
+      id: true,
+      targetType: true,
+      targetId: true,
+      appealStatus: true,
+      restoredAt: true,
+    },
+  });
+
+  if (!reportCase) throw new Error("Không tìm thấy vụ việc báo cáo.");
+  if (reportCase.appealStatus !== "pending") {
+    throw new Error("Vụ việc này không có kháng nghị đang chờ xử lý.");
+  }
+
+  if (normalizedAction === "accept") {
+    await restoreAdminReportCase({ caseId: normalizedCaseId, requester });
+    await prisma.reportCase.update({
+      where: { id: normalizedCaseId },
+      data: {
+        appealStatus: "accepted",
+        appealResolvedAt: new Date(),
+        appealResolvedById: requester.id,
+      },
+    });
+    return getReportSummaryForCase({
+      type: reportCase.targetType,
+      caseId: normalizedCaseId,
+    });
+  }
+
+  let notificationPayload = null;
+  await prisma.$transaction(async (tx) => {
+    const currentCase = await tx.reportCase.findUnique({
+      where: { id: normalizedCaseId },
+      select: {
+        id: true,
+        targetType: true,
+        targetId: true,
+      },
+    });
+    if (!currentCase) throw new Error("Không tìm thấy vụ việc báo cáo.");
+
+    const ownerContext = await getReportCaseOwnerContext({
+      db: tx,
+      reportCase: currentCase,
+    });
+    notificationPayload = ownerContext;
+
+    await tx.reportCase.update({
+      where: { id: normalizedCaseId },
+      data: {
+        appealStatus: "rejected",
+        appealResolvedAt: new Date(),
+        appealResolvedById: requester.id,
+      },
+    });
+  }, { timeout: 15000, maxWait: 10000 });
+
+  if (
+    notificationPayload?.ownerId &&
+    notificationPayload.ownerId !== requester.id
+  ) {
+    await dispatchNotification({
+      recipientId: notificationPayload.ownerId,
+      actorId: requester.id,
+      storyId: notificationPayload.storyId,
+      chapterId: notificationPayload.chapterId,
+      type: "admin_message",
+      title: "Khiếu nại chưa được chấp nhận",
+      body:
+        "Quản trị viên đã xem xét khiếu nại và giữ nguyên quyết định xử lý trước đó.",
+      linkUrl: notificationPayload.linkUrl,
+      meta: {
+        ...notificationPayload.meta,
+        resolution_action: "appeal_rejected",
+        moderated_by: getRequesterDisplayName(requester),
+      },
+    });
+  }
+
+  return getReportSummaryForCase({
+    type: reportCase.targetType,
+    caseId: normalizedCaseId,
+  });
+};
+
+module.exports = {
+  listAdminReports,
+  getAdminReportDetail,
+  updateAdminReportStatus,
+  processCriticalAdminReportCases,
+  restoreAdminReportCase,
+  lockReportCaseAuthor,
+  submitReportCaseAppeal,
+  resolveReportCaseAppeal,
+  reportStory,
+  reportChapter,
+  reportChapterComment,
+};
+
+
+

@@ -1,0 +1,75 @@
+const express = require("express");
+const router = express.Router();
+
+const storyController = require("./story.controller");
+const { authenticate, authenticateOptional } = require("../../middlewares/auth.middleware");
+const { authorize } = require("../../middlewares/role.middleware");
+const { upload } = require("../../middlewares/upload.middleware");
+
+router.get(
+  "/me/list",
+  authenticate,
+  storyController.getMyStories,
+);
+router.get(
+  "/me/stats",
+  authenticate,
+  storyController.getMyStoryStats,
+);
+router.get(
+  "/me/dashboard",
+  authenticate,
+  storyController.getMyDashboard,
+);
+router.get(
+  "/admin/list",
+  authenticate,
+  authorize("admin"),
+  storyController.getAdminStories,
+);
+router.get("/search", storyController.searchStories);
+router.get(
+  "/author/:authorId",
+  authenticateOptional,
+  storyController.getPublishedStoriesByAuthor,
+);
+router.get("/:id/similar", authenticateOptional, storyController.getSimilarStories);
+router.get(
+  "/:id/recommended",
+  authenticateOptional,
+  storyController.getRecommendedStories,
+);
+router.post("/:id/read-event", authenticateOptional, storyController.trackReadEvent);
+router.get("/:id/ratings", authenticateOptional, storyController.listRatings);
+router.get("/:id/rating/me", authenticate, storyController.getMyRating);
+router.put("/:id/rating", authenticate, storyController.upsertRating);
+router.get(
+  "/:id/comments/featured",
+  authenticateOptional,
+  storyController.getFeaturedComments,
+);
+router.post(
+  "/",
+  authenticate,
+  upload.single("cover_file"),
+  storyController.createStory,
+);
+router.patch(
+  "/:id",
+  authenticate,
+  upload.single("cover_file"),
+  storyController.updateStory,
+);
+router.patch(
+  "/:id/status",
+  authenticate,
+  storyController.updateStoryStatus,
+);
+router.delete(
+  "/:id",
+  authenticate,
+  storyController.deleteStory,
+);
+router.get("/:slug", authenticateOptional, storyController.getBySlug);
+
+module.exports = router;
