@@ -11,6 +11,24 @@ const { createQueue, isQueueEnabled } = require("../config/queue");
 
 const REPORT_AI_FOLLOWUP_QUEUE_NAME = "report-ai-followup";
 const queue = createQueue(REPORT_AI_FOLLOWUP_QUEUE_NAME);
+const buildSafeToken = (value, fallback = "unknown") =>
+  String(value || fallback).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+const buildCaseJobId = (payload) =>
+  [
+    "report_ai_case",
+    buildSafeToken(payload.type),
+    buildSafeToken(payload.caseId),
+    buildSafeToken(payload.recipientId, "anon"),
+  ].join("_");
+
+const buildAppealJobId = (payload) =>
+  [
+    "report_ai_appeal",
+    buildSafeToken(payload.reportType),
+    buildSafeToken(payload.caseId),
+    buildSafeToken(payload.recipientId, "anon"),
+  ].join("_");
 
 const enqueueReportCaseAiFollowup = async (payload) => {
   if (!queue || !payload?.caseId) return null;
@@ -18,7 +36,7 @@ const enqueueReportCaseAiFollowup = async (payload) => {
     `case:${payload.type || "unknown"}`,
     { kind: "case", ...payload },
     {
-      jobId: `case:${payload.type}:${payload.caseId}:${payload.recipientId || "anon"}`,
+      jobId: buildCaseJobId(payload),
     },
   );
 };
@@ -29,7 +47,7 @@ const enqueueReportAppealAiFollowup = async (payload) => {
     `appeal:${payload.reportType || "unknown"}`,
     { kind: "appeal", ...payload },
     {
-      jobId: `appeal:${payload.reportType}:${payload.caseId}:${payload.recipientId || "anon"}`,
+      jobId: buildAppealJobId(payload),
     },
   );
 };

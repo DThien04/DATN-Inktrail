@@ -5,7 +5,7 @@ const {
   emitChapterComment,
   emitChapterCommentRemoved,
 } = require("../../realtime/socket");
-const { moderateText } = require("../../utils/moderation");
+const { evaluateChapterPublishRules } = require("./chapter-publish-rules");
 const { evaluateCommentPublishRules } = require("../comment/comment-publish-rules");
 const {
   recomputeChapterFeaturedComment,
@@ -14,15 +14,7 @@ const {
 
 const ALLOWED_CHAPTER_STATUSES = new Set(["draft", "published"]);
 const CHAPTER_COMMENT_NOTIFICATION_TYPE = "chapter_commented";
-const CHAPTER_BACKGROUND_MODERATION_TIMEOUT_MS = 18000;
 const MIN_CHAPTER_WORD_COUNT = 500;
-const CHAPTER_BLOCKED_CATEGORIES = new Set([
-  "harassment",
-  "hate",
-  "sexual",
-  "violence",
-  "self_harm",
-]);
 const COMMENT_MODERATION_STATUS = {
   pending: "pending",
   approved: "approved",
@@ -186,6 +178,7 @@ const formatChapterComment = (comment, requester, featuredCommentId = null) => (
   id: comment.id,
   user_id: comment.userId,
   chapter_id: comment.chapterId,
+  parent_id: comment.parentId ?? null,
   content: comment.content,
   like_count:
     typeof comment.stats?.likeCount === "number" ? comment.stats.likeCount : 0,
@@ -208,6 +201,63 @@ const formatChapterComment = (comment, requester, featuredCommentId = null) => (
     role: comment.user.role,
   },
 });
+
+const buildChapterCommentVisibilityWhere = ({ requester, canViewHiddenComments }) => {
+  if (canViewHiddenComments) return {};
+  if (!requester?.id) {
+    return {
+      isHidden: false,
+      moderationStatus: COMMENT_MODERATION_STATUS.approved,
+    };
+  }
+
+  return {
+    OR: [
+      {
+        isHidden: false,
+        moderationStatus: COMMENT_MODERATION_STATUS.approved,
+      },
+      {
+        userId: requester.id,
+        moderationStatus: COMMENT_MODERATION_STATUS.pending,
+      },
+      {
+        userId: requester.id,
+        moderationStatus: COMMENT_MODERATION_STATUS.rejected,
+      },
+    ],
+  };
+};
+
+const buildChapterCommentThreads = ({ comments, requester, featuredCommentId }) => {
+  const formattedById = new Map(
+    comments.map((comment) => [
+      comment.id,
+      {
+        ...formatChapterComment(comment, requester, featuredCommentId),
+        reply_count: 0,
+        replies: [],
+      },
+    ]),
+  );
+
+  const roots = [];
+  for (const comment of comments) {
+    const formatted = formattedById.get(comment.id);
+    if (!formatted) continue;
+
+    if (comment.parentId && formattedById.has(comment.parentId)) {
+      const parent = formattedById.get(comment.parentId);
+      parent.replies.push(formatted);
+      parent.reply_count += 1;
+      continue;
+    }
+
+    roots.push(formatted);
+  }
+
+  return roots;
+};
 
 const validateCommentContent = (content) => {
   const normalizedContent = normalizeText(content);
@@ -822,6 +872,10 @@ const listChapterComments = async ({ chapterId, requester, sort, limit }) => {
   const chapter = await ensureChapterCanBeCommented({ chapterId, requester });
   const normalizedSort = normalizeText(sort).toLowerCase();
   const canViewHiddenComments = requester?.role === "admin";
+  const visibilityWhere = buildChapterCommentVisibilityWhere({
+    requester,
+    canViewHiddenComments,
+  });
 
   let take = Number(limit);
   if (!Number.isInteger(take) || take <= 0) take = 20;
@@ -835,29 +889,7 @@ const listChapterComments = async ({ chapterId, requester, sort, limit }) => {
   const comments = await prisma.chapterComment.findMany({
     where: {
       chapterId: chapter.id,
-      ...(canViewHiddenComments
-        ? {}
-        : requester?.id
-          ? {
-              OR: [
-                {
-                  isHidden: false,
-                  moderationStatus: COMMENT_MODERATION_STATUS.approved,
-                },
-                {
-                  userId: requester.id,
-                  moderationStatus: COMMENT_MODERATION_STATUS.pending,
-                },
-                {
-                  userId: requester.id,
-                  moderationStatus: COMMENT_MODERATION_STATUS.rejected,
-                },
-              ],
-            }
-          : {
-              isHidden: false,
-              moderationStatus: COMMENT_MODERATION_STATUS.approved,
-            }),
+      ...visibilityWhere,
     },
     orderBy,
     take,
@@ -888,6 +920,11 @@ const listChapterComments = async ({ chapterId, requester, sort, limit }) => {
     select: { commentCount: true },
   });
   const featuredCommentId = await getChapterFeaturedCommentId({ chapterId: chapter.id });
+  const threads = buildChapterCommentThreads({
+    comments,
+    requester,
+    featuredCommentId,
+  });
 
   return {
     chapter: {
@@ -905,7 +942,44 @@ const listChapterComments = async ({ chapterId, requester, sort, limit }) => {
     items: comments.map((comment) =>
       formatChapterComment(comment, requester, featuredCommentId),
     ),
+    threads,
   };
+};
+
+const ensureParentCommentCanReceiveReply = async ({
+  chapterId,
+  parentId,
+  requester,
+}) => {
+  const normalizedParentId = normalizeText(parentId);
+  if (!normalizedParentId) return null;
+
+  const parentComment = await prisma.chapterComment.findUnique({
+    where: { id: normalizedParentId },
+    select: {
+      id: true,
+      chapterId: true,
+      parentId: true,
+      isHidden: true,
+      moderationStatus: true,
+    },
+  });
+
+  if (!parentComment || parentComment.chapterId !== chapterId) {
+    throw new Error("Không tìm thấy bình luận gốc để trả lời.");
+  }
+  if (parentComment.parentId) {
+    throw new Error("Chỉ hỗ trợ trả lời trực tiếp bình luận gốc.");
+  }
+  if (
+    requester?.role !== "admin" &&
+    (parentComment.isHidden ||
+      parentComment.moderationStatus !== COMMENT_MODERATION_STATUS.approved)
+  ) {
+    throw new Error("Bình luận gốc này hiện không thể nhận phản hồi.");
+  }
+
+  return parentComment;
 };
 
 const ensureChapterCommentCanBeLiked = async ({ commentId, requester }) => {
@@ -1021,15 +1095,26 @@ const ensureChapterCommentCanBeManaged = async ({ commentId, requester }) => {
   return comment;
 };
 
-const createChapterComment = async ({ chapterId, requester, content }) => {
+const createChapterComment = async ({
+  chapterId,
+  requester,
+  content,
+  parentId = null,
+}) => {
   if (!requester?.id) throw new Error("Bạn cần đăng nhập để tiếp tục.");
 
   const chapter = await ensureChapterCanBeCommented({ chapterId, requester });
   const normalizedContent = validateCommentContent(content);
+  const parentComment = await ensureParentCommentCanReceiveReply({
+    chapterId: chapter.id,
+    parentId,
+    requester,
+  });
   const createdComment = await prisma.chapterComment.create({
     data: {
       userId: requester.id,
       chapterId: chapter.id,
+      parentId: parentComment?.id ?? null,
       content: normalizedContent,
       moderationStatus: COMMENT_MODERATION_STATUS.pending,
     },
@@ -1276,11 +1361,16 @@ const updateChapterComment = async ({ commentId, requester, content }) => {
 
 const deleteChapterComment = async ({ commentId, requester }) => {
   const comment = await ensureChapterCommentCanBeManaged({ commentId, requester });
-  const shouldDecrementPublicCount =
-    comment.moderationStatus === COMMENT_MODERATION_STATUS.approved &&
-    !comment.isHidden;
 
   return prisma.$transaction(async (tx) => {
+    const approvedDeletedCount = await tx.chapterComment.count({
+      where: {
+        OR: [{ id: comment.id }, { parentId: comment.id }],
+        moderationStatus: COMMENT_MODERATION_STATUS.approved,
+        isHidden: false,
+      },
+    });
+
     await tx.chapterComment.delete({
       where: { id: comment.id },
     });
@@ -1291,8 +1381,8 @@ const deleteChapterComment = async ({ commentId, requester }) => {
     });
 
     let nextCommentCount = 0;
-    if (currentStats && shouldDecrementPublicCount) {
-      nextCommentCount = Math.max(0, currentStats.commentCount - 1);
+    if (currentStats && approvedDeletedCount > 0) {
+      nextCommentCount = Math.max(0, currentStats.commentCount - approvedDeletedCount);
       await tx.chapterStat.update({
         where: { chapterId: comment.chapterId },
         data: { commentCount: nextCommentCount },
@@ -1307,6 +1397,8 @@ const deleteChapterComment = async ({ commentId, requester }) => {
       deleted: true,
       comment_id: comment.id,
       chapter_id: comment.chapterId,
+      parent_id: comment.parentId ?? null,
+      deleted_count: approvedDeletedCount,
       comment_count: nextCommentCount,
     };
   });
@@ -1634,22 +1726,41 @@ const publishChapter = async ({ chapterId, requester }) => {
     );
   }
 
+  const violations = evaluateChapterPublishRules({
+    title: chapter.title,
+    content: chapter.content,
+    normalizeText,
+  });
+  if (violations.length > 0) {
+    const primaryViolation = violations[0];
+
+    await prisma.chapter.update({
+      where: { id: chapter.id },
+      data: {
+        status: "draft",
+        publishedAt: null,
+        moderationStatus: "rejected",
+        moderationCheckedAt: new Date(),
+        moderationCategories: violations.map((violation) => violation.code),
+        moderationConfidence: null,
+        moderationReason: primaryViolation.message,
+        lastRejectedContentHash: nextModerationHash,
+      },
+    });
+
+    throw new Error(primaryViolation.message);
+  }
+
   const data = {};
   if (chapter.status !== "published") {
     data.status = "published";
     data.publishedAt = chapter.publishedAt || new Date();
-    if (
-      chapter.lastApprovedContentHash &&
-      chapter.lastApprovedContentHash === nextModerationHash
-    ) {
-      data.moderationStatus = "approved";
-    } else {
-      data.moderationStatus = "pending";
-      data.moderationCheckedAt = null;
-      data.moderationCategories = null;
-      data.moderationConfidence = null;
-      data.moderationReason = null;
-    }
+    data.moderationStatus = "approved";
+    data.moderationCheckedAt = new Date();
+    data.moderationCategories = null;
+    data.moderationConfidence = null;
+    data.moderationReason = null;
+    data.lastApprovedContentHash = nextModerationHash;
   }
 
   if (chapter.hiddenById === null) {
@@ -1667,14 +1778,6 @@ const publishChapter = async ({ chapterId, requester }) => {
     where: { id: chapter.id },
     data,
   });
-
-  if (
-    requester?.role !== "admin" &&
-    chapter.status !== "published" &&
-    data.moderationStatus === "pending"
-  ) {
-    scheduleChapterModeration(updatedChapter.id, chapter.story.authorId);
-  }
 
   if (
     chapter.status !== "published" &&

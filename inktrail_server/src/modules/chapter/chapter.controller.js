@@ -94,6 +94,7 @@ const createComment = async (req, res) => {
       chapterId: req.params.id,
       requester: req.user,
       content: req.body.content,
+      parentId: req.body.parent_id ?? req.body.parentId ?? null,
     });
 
     res.status(201).json({

@@ -11,7 +11,8 @@ export type AdminReportResolutionAction =
   | "ignored"
   | "comment_removed"
   | "chapter_hidden"
-  | "story_hidden";
+  | "story_hidden"
+  | "account_locked";
 export type AdminReportAiSeverity = "low" | "medium" | "high" | "critical";
 export type AdminReportAiSuggestedAction =
   | "allow"

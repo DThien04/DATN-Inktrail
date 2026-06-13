@@ -9,7 +9,7 @@ class DioClient {
   late final Dio _refreshDio;
   final TokenStorage _tokenStorage;
   final VoidCallback? onForceLogout;
-  static const _baseUrl = 'https://inktrail-server-1.onrender.com/api';
+  static const _baseUrl = 'http://192.168.1.248:8080/api';
   DioClient(this._tokenStorage, {this.onForceLogout}) {
     _dio = Dio(
       BaseOptions(

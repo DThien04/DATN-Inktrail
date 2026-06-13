@@ -60,11 +60,15 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
   bool _isLoading = true;
   bool _isSending = false;
   String? _editingCommentId;
+  String? _replyTargetCommentId;
   String? _errorMessage;
   _ReaderPageState? get _readerPageState =>
       context.findAncestorStateOfType<_ReaderPageState>();
   String get _currentUserId => _readerPageState?._currentUserId ?? '';
   bool get _isAdmin => _readerPageState?._isCurrentUserAdmin ?? false;
+  bool _belongsToCurrentUser(ReaderCommentView comment) =>
+      comment.isMine ||
+      (_currentUserId.isNotEmpty && comment.userId == _currentUserId);
   int get _approvedCommentCount =>
       _comments.where((item) => item.isApproved).length;
   int get _effectiveApprovedTotal =>
@@ -72,11 +76,19 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
   int get _visibleCommentCount =>
       _effectiveApprovedTotal +
       _comments
-          .where((item) => item.isMine && !item.isApproved)
+          .where((item) => _belongsToCurrentUser(item) && !item.isApproved)
           .length;
 
+  List<ReaderCommentView> get _rootComments =>
+      _comments.where((item) => !item.isReply).toList();
+
+  List<ReaderCommentView> _repliesFor(String parentId) => _comments
+      .where((item) => item.parentId == parentId)
+      .toList()
+    ..sort((a, b) => a.timestampOrder.compareTo(b.timestampOrder));
+
   List<ReaderCommentView> get _sortedComments {
-    final items = List<ReaderCommentView>.from(_comments);
+    final items = List<ReaderCommentView>.from(_rootComments);
     if (_sort == _ReaderCommentSort.hot) {
       items.sort((a, b) {
         final highlightedOrder =
@@ -102,6 +114,15 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
     return null;
   }
 
+  ReaderCommentView? get _replyTargetComment {
+    final replyId = _replyTargetCommentId;
+    if (replyId == null || replyId.isEmpty) return null;
+    for (final item in _comments) {
+      if (item.id == replyId) return item;
+    }
+    return null;
+  }
+
   Future<void> _handleHiddenChapter() async {
     if (!mounted) return;
     Navigator.of(context).pop();
@@ -110,23 +131,45 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
     });
   }
 
+  void _clearComposerState() {
+    _editingCommentId = null;
+    _replyTargetCommentId = null;
+    _controller.clear();
+    _focusNode.unfocus();
+  }
+
+  void _beginReplyToComment(ReaderCommentView comment) {
+    setState(() {
+      _replyTargetCommentId = comment.id;
+      _editingCommentId = null;
+    });
+    _controller.clear();
+    _focusNode.requestFocus();
+  }
+
   void _removeCommentLocally(String commentId) {
     if (commentId.isEmpty) return;
-    final comment = _comments.cast<ReaderCommentView?>().firstWhere(
-          (item) => item?.id == commentId,
-          orElse: () => null,
-        );
-    if (comment == null) return;
+    final removedItems = _comments
+        .where((item) => item.id == commentId || item.parentId == commentId)
+        .toList();
+    if (removedItems.isEmpty) return;
 
     setState(() {
-      _comments = _comments.where((item) => item.id != commentId).toList();
-      if (comment.isApproved) {
-        _totalComments = _totalComments > 0 ? _totalComments - 1 : 0;
+      _comments = _comments
+          .where((item) => item.id != commentId && item.parentId != commentId)
+          .toList();
+      final approvedRemovedCount =
+          removedItems.where((item) => item.isApproved).length;
+      if (approvedRemovedCount > 0) {
+        _totalComments =
+            _totalComments > approvedRemovedCount ? _totalComments - approvedRemovedCount : 0;
       }
-      if (_editingCommentId == commentId) {
-        _editingCommentId = null;
-        _controller.clear();
-        _focusNode.unfocus();
+      if (_editingCommentId == commentId ||
+          removedItems.any((item) => item.id == _editingCommentId)) {
+        _clearComposerState();
+      } else if (_replyTargetCommentId == commentId ||
+          removedItems.any((item) => item.id == _replyTargetCommentId)) {
+        _replyTargetCommentId = null;
       }
     });
     widget.onCommentCountChanged(_approvedCommentCount);
@@ -355,7 +398,7 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
           );
       if (removedComment == null) return;
 
-      if (removedComment.isMine ||
+      if (_belongsToCurrentUser(removedComment) ||
           (currentUserId.isNotEmpty && userId == currentUserId)) {
         final reason = (payload['reason'] ?? '').toString().trim();
         setState(() {
@@ -384,6 +427,7 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
     if (content.isEmpty) return;
     if (!await AuthGate.requireAuth(context)) return;
     final editingComment = _editingComment;
+    final replyTarget = _replyTargetComment;
 
     setState(() => _isSending = true);
     try {
@@ -391,6 +435,7 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
           ? await _saveComment.create(
               chapterId: widget.chapterId,
               content: content,
+              parentId: replyTarget?.id,
             )
           : await _saveComment.update(
               commentId: editingComment.id,
@@ -404,9 +449,9 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
                   currentUserId: _currentUserId,
                 );
       if (!mounted) return;
-      _controller.clear();
-      _focusNode.unfocus();
-      _editingCommentId = null;
+      setState(() {
+        _clearComposerState();
+      });
       if (comment != null) {
         setState(() {
           _comments = mergeReaderCommentViews(_comments, comment);
@@ -436,11 +481,18 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (context) {
-        final canManage = comment.isMine || _isAdmin;
+        final canManage = _belongsToCurrentUser(comment) || _isAdmin;
+        final canReply = !comment.isReply && comment.isApproved;
         return SafeArea(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (canReply)
+                ListTile(
+                  leading: const Icon(Icons.reply_rounded),
+                  title: const Text('Trả lời bình luận'),
+                  onTap: () => Navigator.of(context).pop('reply'),
+                ),
               if (canManage) ...[
                 ListTile(
                   leading: const Icon(Icons.edit_rounded),
@@ -466,12 +518,19 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
     );
 
     if (!mounted || action == null) return;
+    if (action == 'reply') {
+      _beginReplyToComment(comment);
+      return;
+    }
     if (action == 'report') {
       await _openReportCommentSheet(comment);
       return;
     }
     if (action == 'edit') {
-      setState(() => _editingCommentId = comment.id);
+      setState(() {
+        _editingCommentId = comment.id;
+        _replyTargetCommentId = null;
+      });
       _controller.text = comment.content;
       _controller.selection = TextSelection.fromPosition(
         TextPosition(offset: _controller.text.length),
@@ -573,15 +632,23 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
   Future<void> _deleteComment(ReaderCommentView comment) async {
     final previousItems = List<ReaderCommentView>.from(_comments);
     final previousTotal = _totalComments;
+    final removedItems = _comments
+        .where((item) => item.id == comment.id || item.parentId == comment.id)
+        .toList();
+    final approvedRemovedCount =
+        removedItems.where((item) => item.isApproved).length;
 
     setState(() {
-      _comments = _comments.where((item) => item.id != comment.id).toList();
-      if (comment.isApproved) {
-        _totalComments = (_totalComments > 0 ? _totalComments - 1 : 0);
+      _comments = _comments
+          .where((item) => item.id != comment.id && item.parentId != comment.id)
+          .toList();
+      if (approvedRemovedCount > 0) {
+        _totalComments =
+            _totalComments > approvedRemovedCount ? _totalComments - approvedRemovedCount : 0;
       }
-      if (_editingCommentId == comment.id) {
-        _editingCommentId = null;
-        _controller.clear();
+      if (removedItems.any((item) => item.id == _editingCommentId) ||
+          removedItems.any((item) => item.id == _replyTargetCommentId)) {
+        _clearComposerState();
       }
     });
     widget.onCommentCountChanged(_approvedCommentCount);
@@ -762,37 +829,79 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
                         ),
                       );
                     }
-                    return ListView.separated(
+                    return ListView.builder(
                       padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
                       itemCount: comments.length,
-                      separatorBuilder: (_, _) => Divider(
-                        height: 1,
-                        color: widget.borderColor.withValues(alpha: 0.65),
-                      ),
                       itemBuilder: (_, index) {
                         final comment = comments[index];
-                        return _ReaderCommentTile(
-                          comment: comment,
-                          isDarkMode: widget.isDarkMode,
-                          borderColor: widget.borderColor,
-                          titleColor: widget.titleColor,
-                          bodyColor: widget.bodyColor,
-                          mutedColor: widget.mutedColor,
-                          accentColor: widget.accentColor,
-                          isLiking: _likingCommentIds.contains(comment.id),
-                          onToggleLike: () =>
-                              unawaited(_toggleCommentLike(comment)),
-                          onAuthorTap: comment.userId.isEmpty
-                              ? null
-                              : () => openUserProfile(
-                                    context,
-                                    userId: comment.userId,
-                                    initialName: comment.author,
-                                  ),
-                          onLongPress: () =>
-                              unawaited(_openCommentActions(comment)),
-                          onMoreTap: () =>
-                              unawaited(_openCommentActions(comment)),
+                        final replies = _repliesFor(comment.id);
+                        return Column(
+                          children: [
+                            _ReaderCommentTile(
+                              comment: comment,
+                              isDarkMode: widget.isDarkMode,
+                              borderColor: widget.borderColor,
+                              titleColor: widget.titleColor,
+                              bodyColor: widget.bodyColor,
+                              mutedColor: widget.mutedColor,
+                              accentColor: widget.accentColor,
+                              isLiking: _likingCommentIds.contains(comment.id),
+                              onToggleLike: () =>
+                                  unawaited(_toggleCommentLike(comment)),
+                              onAuthorTap: comment.userId.isEmpty
+                                  ? null
+                                  : () => openUserProfile(
+                                        context,
+                                        userId: comment.userId,
+                                        initialName: comment.author,
+                                      ),
+                              onLongPress: () =>
+                                  unawaited(_openCommentActions(comment)),
+                              onMoreTap: () =>
+                                  unawaited(_openCommentActions(comment)),
+                              onReplyTap: !comment.isApproved
+                                  ? null
+                                  : () => _beginReplyToComment(comment),
+                            ),
+                            if (replies.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(left: 54),
+                                child: Column(
+                                  children: replies
+                                      .map(
+                                        (reply) => _ReaderCommentTile(
+                                          comment: reply,
+                                          isDarkMode: widget.isDarkMode,
+                                          borderColor: widget.borderColor,
+                                          titleColor: widget.titleColor,
+                                          bodyColor: widget.bodyColor,
+                                          mutedColor: widget.mutedColor,
+                                          accentColor: widget.accentColor,
+                                          isCompact: true,
+                                          isLiking: _likingCommentIds.contains(reply.id),
+                                          onToggleLike: () =>
+                                              unawaited(_toggleCommentLike(reply)),
+                                          onAuthorTap: reply.userId.isEmpty
+                                              ? null
+                                              : () => openUserProfile(
+                                                    context,
+                                                    userId: reply.userId,
+                                                    initialName: reply.author,
+                                                  ),
+                                          onLongPress: () =>
+                                              unawaited(_openCommentActions(reply)),
+                                          onMoreTap: () =>
+                                              unawaited(_openCommentActions(reply)),
+                                        ),
+                                      )
+                                      .toList(),
+                                ),
+                              ),
+                            Divider(
+                              height: 1,
+                              color: widget.borderColor.withValues(alpha: 0.65),
+                            ),
+                          ],
                         );
                       },
                     );
@@ -810,79 +919,126 @@ class _ChapterCommentSheetState extends State<_ChapterCommentSheet> {
                   color: widget.surfaceColor,
                   border: Border(top: BorderSide(color: widget.borderColor)),
                 ),
-                child: Row(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Expanded(
-                      child: Container(
-                        height: 46,
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        decoration: BoxDecoration(
-                          color: widget.borderColor.withValues(alpha: 0.28),
-                          borderRadius: BorderRadius.circular(16),
+                    if (_replyTargetComment != null || _editingComment != null)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
                         ),
-                        alignment: Alignment.centerLeft,
-                        child: TextField(
-                          controller: _controller,
-                          focusNode: _focusNode,
-                          minLines: 1,
-                          maxLines: 1,
-                          textInputAction: TextInputAction.send,
-                          onSubmitted: (_) => unawaited(_sendComment()),
-                          decoration: InputDecoration(
-                            isCollapsed: true,
-                            border: InputBorder.none,
-                            hintText: widget.placeholder,
-                            hintStyle: TextStyle(
-                              fontSize: 14,
-                              color: widget.mutedColor,
-                              fontWeight: FontWeight.w500,
+                        decoration: BoxDecoration(
+                          color: widget.borderColor.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _editingComment != null
+                                    ? 'Đang sửa bình luận'
+                                    : 'Đang trả lời ${_replyTargetComment!.author}',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  color: widget.titleColor,
+                                ),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                setState(() {
+                                  _replyTargetCommentId = null;
+                                  _editingCommentId = null;
+                                  _controller.clear();
+                                });
+                              },
+                              child: const Text('Hủy'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Container(
+                            height: 46,
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            decoration: BoxDecoration(
+                              color: widget.borderColor.withValues(alpha: 0.28),
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            alignment: Alignment.centerLeft,
+                            child: TextField(
+                              controller: _controller,
+                              focusNode: _focusNode,
+                              minLines: 1,
+                              maxLines: 1,
+                              textInputAction: TextInputAction.send,
+                              onSubmitted: (_) => unawaited(_sendComment()),
+                              decoration: InputDecoration(
+                                isCollapsed: true,
+                                border: InputBorder.none,
+                                hintText: _editingComment != null
+                                    ? 'Chỉnh sửa bình luận...'
+                                    : _replyTargetComment != null
+                                        ? 'Trả lời ${_replyTargetComment!.author}...'
+                                        : widget.placeholder,
+                                hintStyle: TextStyle(
+                                  fontSize: 14,
+                                  color: widget.mutedColor,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: widget.titleColor,
+                                fontWeight: FontWeight.w500,
+                              ),
                             ),
                           ),
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: widget.titleColor,
-                            fontWeight: FontWeight.w500,
-                          ),
                         ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    GestureDetector(
-                      onTap: _canSend ? () => unawaited(_sendComment()) : null,
-                      child: AnimatedOpacity(
-                        duration: const Duration(milliseconds: 150),
-                        opacity: _canSend ? 1 : 0.56,
-                        child: Container(
-                          width: 46,
-                          height: 46,
-                          decoration: BoxDecoration(
-                            color: widget.isDarkMode
-                                ? widget.borderColor.withValues(alpha: 0.22)
-                                : kReaderLightAccentWash(0.14),
-                            borderRadius: BorderRadius.circular(16),
-                            border: widget.isDarkMode
-                                ? Border.all(
-                                    color: widget.borderColor.withValues(alpha: 0.65),
-                                  )
-                                : null,
-                          ),
-                          child: _isSending
-                              ? Padding(
-                                  padding: const EdgeInsets.all(13),
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation<Color>(
-                                      widget.accentColor,
+                        const SizedBox(width: 10),
+                        GestureDetector(
+                          onTap: _canSend ? () => unawaited(_sendComment()) : null,
+                          child: AnimatedOpacity(
+                            duration: const Duration(milliseconds: 150),
+                            opacity: _canSend ? 1 : 0.56,
+                            child: Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: widget.isDarkMode
+                                    ? widget.borderColor.withValues(alpha: 0.22)
+                                    : kReaderLightAccentWash(0.14),
+                                borderRadius: BorderRadius.circular(16),
+                                border: widget.isDarkMode
+                                    ? Border.all(
+                                        color: widget.borderColor.withValues(alpha: 0.65),
+                                      )
+                                    : null,
+                              ),
+                              child: _isSending
+                                  ? Padding(
+                                      padding: const EdgeInsets.all(13),
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        valueColor: AlwaysStoppedAnimation<Color>(
+                                          widget.accentColor,
+                                        ),
+                                      ),
+                                    )
+                                  : Icon(
+                                      Icons.send_rounded,
+                                      size: 19,
+                                      color: widget.accentColor,
                                     ),
-                                  ),
-                                )
-                              : Icon(
-                                  Icons.send_rounded,
-                                  size: 19,
-                                  color: widget.accentColor,
-                                ),
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
                   ],
                 ),

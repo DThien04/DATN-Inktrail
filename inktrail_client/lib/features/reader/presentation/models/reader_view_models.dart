@@ -44,6 +44,7 @@ class ReaderCommentView {
   final String id;
   final String? storyId;
   final String? chapterId;
+  final String? parentId;
   final String userId;
   final String author;
   final String content;
@@ -60,6 +61,7 @@ class ReaderCommentView {
     this.id = '',
     this.storyId,
     this.chapterId,
+    this.parentId,
     this.userId = '',
     required this.author,
     required this.content,
@@ -76,6 +78,7 @@ class ReaderCommentView {
   bool get isPending => moderationStatus == 'pending';
   bool get isApproved => moderationStatus == 'approved';
   bool get isRejected => moderationStatus == 'rejected';
+  bool get isReply => (parentId ?? '').isNotEmpty;
 
   factory ReaderCommentView.fromEntity(
     ReaderCommentEntity entity, {
@@ -85,6 +88,7 @@ class ReaderCommentView {
       id: entity.id,
       storyId: entity.storyId,
       chapterId: entity.chapterId,
+      parentId: entity.parentId,
       userId: entity.userId,
       author: entity.author.isEmpty
           ? 'Người dùng'
@@ -119,6 +123,7 @@ class ReaderCommentView {
     int? timestampOrder,
     bool? isHighlighted,
     bool? isMine,
+    String? parentId,
     String? moderationStatus,
     String? moderationReason,
   }) {
@@ -126,6 +131,7 @@ class ReaderCommentView {
       id: id,
       storyId: storyId,
       chapterId: chapterId,
+      parentId: parentId ?? this.parentId,
       userId: userId,
       author: author,
       content: content ?? this.content,

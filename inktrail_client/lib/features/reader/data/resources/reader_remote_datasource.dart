@@ -44,6 +44,7 @@ abstract class ReaderRemoteDatasource {
   Future<ReaderCommentModel?> createChapterComment({
     required String chapterId,
     required String content,
+    String? parentId,
   });
 
   Future<ReaderCommentModel?> updateChapterComment({
@@ -188,11 +189,15 @@ class ReaderRemoteDatasourceImpl implements ReaderRemoteDatasource {
   Future<ReaderCommentModel?> createChapterComment({
     required String chapterId,
     required String content,
+    String? parentId,
   }) async {
     try {
       final response = await _dio.post(
         '/chapters/$chapterId/comments',
-        data: <String, dynamic>{'content': content},
+        data: <String, dynamic>{
+          'content': content,
+          if (parentId != null && parentId.isNotEmpty) 'parent_id': parentId,
+        },
       );
       final data = response.data as Map<String, dynamic>? ?? const {};
       return ReaderCommentModel.tryFromJson(data['comment']);

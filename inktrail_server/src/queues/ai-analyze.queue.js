@@ -14,7 +14,7 @@ const AI_ANALYZE_QUEUE_NAME = "report-ai-analyze";
 
 const queue = createQueue(AI_ANALYZE_QUEUE_NAME);
 
-const buildJobId = ({ type, caseId }) => `${type}:${caseId}`;
+const buildJobId = ({ type, caseId }) => `report_ai_${type}_${caseId}`;
 
 const enqueueAiAnalyze = async ({ type, caseId }) => {
   if (!type || !caseId) return null;

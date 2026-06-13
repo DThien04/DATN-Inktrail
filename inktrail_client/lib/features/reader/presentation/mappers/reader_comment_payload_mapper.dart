@@ -17,6 +17,7 @@ ReaderCommentEntity? readerCommentEntityFromPayload(dynamic raw) {
     id: (raw['id'] ?? '').toString(),
     storyId: (raw['story_id'] ?? raw['storyId'] ?? '').toString(),
     chapterId: (raw['chapter_id'] ?? raw['chapterId'] ?? '').toString(),
+    parentId: (raw['parent_id'] ?? raw['parentId'])?.toString(),
     userId: userId,
     author: author.isEmpty ? 'Người dùng' : author,
     content: (raw['content'] ?? '').toString().trim(),

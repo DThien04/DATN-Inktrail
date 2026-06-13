@@ -36,6 +36,7 @@ type ResolutionAction =
   | "comment_removed"
   | "chapter_hidden"
   | "story_hidden"
+  | "account_locked"
   | null;
 type ReportSortKey =
   | "target"
@@ -326,6 +327,7 @@ function getResolutionActionLabel(action: ResolutionAction, type: AdminReportTyp
   if (!action) return "--";
   if (action === "ignored") return "Bỏ qua";
   if (action === "comment_removed") return "Gỡ bình luận";
+  if (action === "account_locked") return "Khóa tài khoản";
   if (action === "chapter_hidden" || type === "chapter") return "Ẩn chương";
   if (action === "story_hidden" || type === "story") return "Ẩn truyện";
   return "Đã xử lý";
@@ -608,13 +610,22 @@ function buildReportCases(items: AdminReportListItem[]): ReportCase[] {
               : "chapter_hidden"
             : "ignored";
 
-      const workflowStatus =
-        representative.caseStatus ??
-        (sortedItems.every((item) => item.status !== "pending") ? "resolved" : "pending");
+      const workflowStatus = representative.caseAccountLockApplied
+        ? "resolved"
+        : representative.caseStatus ??
+          (sortedItems.every((item) => item.status !== "pending")
+            ? "resolved"
+            : "pending");
       const resolutionAction =
+        representative.caseAccountLockApplied
+          ? "account_locked"
+          :
         representative.caseResolutionAction ??
         (workflowStatus === "resolved" ? inferredResolutionAction : null);
       const previousResolutionAction =
+        representative.caseAccountLockApplied
+          ? "account_locked"
+          :
         representative.caseLastResolutionAction ??
         (resolvedItems.length > 0 ? inferredResolutionAction : null);
       const latestResolvedItem =
@@ -732,8 +743,6 @@ export function ReportsPanel() {
   const [lockAuthorTarget, setLockAuthorTarget] = useState<ReportCase | null>(null);
   const [lockAuthorReason, setLockAuthorReason] = useState("");
   const [lockAuthorUntil, setLockAuthorUntil] = useState("");
-  const [lockAuthorAlsoResolveContent, setLockAuthorAlsoResolveContent] =
-    useState(true);
   const [lockAuthorSummary, setLockAuthorSummary] =
     useState<AdminViolationSummary | null>(null);
   const [lockAuthorSummaryLoading, setLockAuthorSummaryLoading] = useState(false);
@@ -1158,7 +1167,6 @@ export function ReportsPanel() {
     setLockAuthorTarget(reportCase);
     setLockAuthorReason("");
     setLockAuthorUntil("");
-    setLockAuthorAlsoResolveContent(true);
     setLockAuthorError(null);
     setLockAuthorSummary(null);
     setLockAuthorSummaryLoading(true);
@@ -1182,7 +1190,6 @@ export function ReportsPanel() {
     setLockAuthorTarget(null);
     setLockAuthorReason("");
     setLockAuthorUntil("");
-    setLockAuthorAlsoResolveContent(true);
     setLockAuthorSummary(null);
     setLockAuthorError(null);
   }
@@ -1216,7 +1223,7 @@ export function ReportsPanel() {
           lockedUntil: lockAuthorUntil
             ? new Date(lockAuthorUntil).toISOString()
             : null,
-          alsoResolveContent: lockAuthorAlsoResolveContent,
+          alsoResolveContent: false,
         },
       );
 
@@ -1226,6 +1233,9 @@ export function ReportsPanel() {
           item.caseId === result.caseId
             ? {
                 ...item,
+                caseStatus: "resolved",
+                caseResolutionAction: "account_locked",
+                caseLastResolutionAction: "account_locked",
                 caseAccountLockApplied: result.accountLockApplied,
                 caseAccountLockedUserId: lockedUserId,
               }
@@ -1233,14 +1243,11 @@ export function ReportsPanel() {
         ),
       );
 
-      if (lockAuthorAlsoResolveContent) {
-        await loadReports({ reloading: true });
-      }
+      await loadReports({ reloading: true });
 
       setLockAuthorTarget(null);
       setLockAuthorReason("");
       setLockAuthorUntil("");
-      setLockAuthorAlsoResolveContent(true);
       setLockAuthorSummary(null);
     } catch (lockError) {
       setLockAuthorError(
@@ -2134,16 +2141,6 @@ export function ReportsPanel() {
                           ) : null}
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
-                          {!selectedCase.accountLockApplied ? (
-                            <button
-                              type="button"
-                              disabled={isUpdatingStatus}
-                              onClick={() => void openLockAuthorModal(selectedCase)}
-                              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              Khóa tài khoản
-                            </button>
-                          ) : null}
                           {canRestoreReportCase(selectedCase) ? (
                             <button
                               type="button"
@@ -2454,20 +2451,12 @@ export function ReportsPanel() {
                   className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm outline-none focus:border-accent"
                 />
               </label>
-              <label className="flex items-start gap-2 text-sm text-foreground">
-                <input
-                  type="checkbox"
-                  checked={lockAuthorAlsoResolveContent}
-                  onChange={(event) =>
-                    setLockAuthorAlsoResolveContent(event.target.checked)
-                  }
-                  className="mt-0.5 h-4 w-4"
-                />
-                <span>
-                  Đồng thời {lockAuthorTarget.type === "chapter_comment" ? "gỡ" : "ẩn"}{" "}
-                  nội dung của vụ việc này.
-                </span>
-              </label>
+              <div className="rounded-lg border border-border bg-surface-muted px-3 py-2 text-sm text-muted-foreground">
+                Hành động <span className="font-semibold text-foreground">Khóa tài khoản</span>{" "}
+                sẽ được tính là một quyết định xử lý riêng cho vụ việc này. Nếu muốn{" "}
+                {lockAuthorTarget.type === "chapter_comment" ? "gỡ bình luận" : "ẩn nội dung"},
+                hãy dùng hành động tương ứng thay vì khóa.
+              </div>
               {lockAuthorError ? (
                 <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
                   {lockAuthorError}

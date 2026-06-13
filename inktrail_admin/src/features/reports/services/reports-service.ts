@@ -402,7 +402,7 @@ export async function getUserViolationSummary(
 export type LockReportCaseAuthorPayload = {
   reason: string;
   lockedUntil: string | null;
-  alsoResolveContent: boolean;
+  alsoResolveContent?: boolean;
 };
 
 export type LockReportCaseAuthorResult = {

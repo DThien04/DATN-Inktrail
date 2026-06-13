@@ -274,8 +274,10 @@ class _ReaderCommentTile extends StatelessWidget {
   final Color bodyColor;
   final Color mutedColor;
   final Color accentColor;
+  final bool isCompact;
   final bool isLiking;
   final VoidCallback onToggleLike;
+  final VoidCallback? onReplyTap;
   final VoidCallback? onLongPress;
   final VoidCallback? onMoreTap;
   final VoidCallback? onAuthorTap;
@@ -288,8 +290,10 @@ class _ReaderCommentTile extends StatelessWidget {
     required this.bodyColor,
     required this.mutedColor,
     required this.accentColor,
+    this.isCompact = false,
     this.isLiking = false,
     required this.onToggleLike,
+    this.onReplyTap,
     this.onLongPress,
     this.onMoreTap,
     this.onAuthorTap,
@@ -316,8 +320,8 @@ class _ReaderCommentTile extends StatelessWidget {
               child: Padding(
                 padding: const EdgeInsets.only(top: 2),
                 child: Container(
-                  width: 40,
-                  height: 40,
+                  width: isCompact ? 34 : 40,
+                  height: isCompact ? 34 : 40,
                   decoration: BoxDecoration(
                     color: isDarkMode
                         ? borderColor.withValues(alpha: 0.22)
@@ -328,7 +332,7 @@ class _ReaderCommentTile extends StatelessWidget {
                   child: Text(
                     comment.author.substring(0, 1).toUpperCase(),
                     style: TextStyle(
-                      fontSize: 14,
+                      fontSize: isCompact ? 12 : 14,
                       fontWeight: FontWeight.w700,
                       color: accentColor,
                     ),
@@ -356,7 +360,7 @@ class _ReaderCommentTile extends StatelessWidget {
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
-                                    fontSize: 14,
+                                    fontSize: isCompact ? 13 : 14,
                                     fontWeight: FontWeight.w700,
                                     color: titleColor,
                                   ),
@@ -411,74 +415,92 @@ class _ReaderCommentTile extends StatelessWidget {
                   Text(
                     comment.timeText,
                     style: TextStyle(
-                      fontSize: 11,
+                      fontSize: isCompact ? 10 : 11,
                       color: mutedColor,
                     ),
                   ),
-                  const SizedBox(height: 10),
+                  SizedBox(height: isCompact ? 8 : 10),
                   Text(
                     displayContent,
                     style: TextStyle(
-                      fontSize: 13,
+                      fontSize: isCompact ? 12 : 13,
                       height: 1.45,
                       color: showRejectedState ? mutedColor : bodyColor,
                       decoration: TextDecoration.none,
                     ),
                   ),
                   const SizedBox(height: 8),
-                  GestureDetector(
-                    onTap: isLiking || comment.isPending || showRejectedState
-                        ? null
-                        : onToggleLike,
-                    child: AnimatedOpacity(
-                      duration: const Duration(milliseconds: 150),
-                      opacity:
-                          isLiking || comment.isPending || showRejectedState
-                              ? 0.58
-                              : 1,
-                      child: Row(
-                        children: [
-                          SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: isLiking
-                                ? Padding(
-                                    padding: const EdgeInsets.all(2),
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 1.8,
-                                      valueColor: AlwaysStoppedAnimation<Color>(
+                  Row(
+                    children: [
+                      GestureDetector(
+                        onTap: isLiking || comment.isPending || showRejectedState
+                            ? null
+                            : onToggleLike,
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 150),
+                          opacity:
+                              isLiking || comment.isPending || showRejectedState
+                                  ? 0.58
+                                  : 1,
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: isLiking
+                                    ? Padding(
+                                        padding: const EdgeInsets.all(2),
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 1.8,
+                                          valueColor: AlwaysStoppedAnimation<Color>(
+                                            comment.isLiked
+                                                ? const Color(0xFFC95E53)
+                                                : mutedColor,
+                                          ),
+                                        ),
+                                      )
+                                    : Icon(
                                         comment.isLiked
+                                            ? Icons.favorite_rounded
+                                            : Icons.favorite_border_rounded,
+                                        size: 16,
+                                        color: comment.isLiked
                                             ? const Color(0xFFC95E53)
                                             : mutedColor,
                                       ),
-                                    ),
-                                  )
-                                : Icon(
-                                    comment.isLiked
-                                        ? Icons.favorite_rounded
-                                        : Icons.favorite_border_rounded,
-                                    size: 16,
-                                    color: comment.isLiked
-                                        ? const Color(0xFFC95E53)
-                                        : mutedColor,
-                                  ),
+                              ),
+                              const SizedBox(width: 5),
+                              Text(
+                                comment.likeCount <= 0
+                                    ? 'Thích'
+                                    : '${comment.likeCount} lượt thích',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: comment.isLiked
+                                      ? const Color(0xFFC95E53)
+                                      : mutedColor,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 5),
-                          Text(
-                            comment.likeCount <= 0
-                                ? 'Thích'
-                                : '${comment.likeCount} lượt thích',
+                        ),
+                      ),
+                      if (onReplyTap != null) ...[
+                        const SizedBox(width: 14),
+                        GestureDetector(
+                          onTap: onReplyTap,
+                          child: Text(
+                            'Trả lời',
                             style: TextStyle(
                               fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                              color: comment.isLiked
-                                  ? const Color(0xFFC95E53)
-                                  : mutedColor,
+                              fontWeight: FontWeight.w700,
+                              color: accentColor,
                             ),
                           ),
-                        ],
-                      ),
-                    ),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),

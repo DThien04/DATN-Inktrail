@@ -85,10 +85,12 @@ class ReaderRepoImpl implements ReaderRepository {
   Future<ReaderCommentEntity?> createChapterComment({
     required String chapterId,
     required String content,
+    String? parentId,
   }) {
     return _datasource.createChapterComment(
       chapterId: chapterId,
       content: content,
+      parentId: parentId,
     );
   }
 

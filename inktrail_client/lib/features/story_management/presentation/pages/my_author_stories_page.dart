@@ -26,15 +26,14 @@ class MyAuthorStoriesPage extends StatelessWidget {
     MyStoryEntity? story,
     String? forcedStatus,
   }) {
-    return showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => BlocProvider.value(
-        value: context.read<MyAuthorStoriesCubit>(),
-        child: _StoryEditorSheet(
-          story: story,
-          forcedStatus: forcedStatus,
+    return Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => BlocProvider.value(
+          value: context.read<MyAuthorStoriesCubit>(),
+          child: _StoryEditorSheet(
+            story: story,
+            forcedStatus: forcedStatus,
+          ),
         ),
       ),
     );
@@ -715,7 +714,7 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
 
   String _successMessage() {
     if (_draftFlow) return 'Truyện đã được chuyển về bản nháp.';
-    if (_publishFlow) return 'Đã gửi xuất bản. Truyện sẽ được duyệt trong nền.';
+    if (_publishFlow) return 'Truyện đã được xuất bản thành công.';
     return _isEditing ? 'Đã cập nhật truyện.' : 'Đã tạo truyện mới.';
   }
 
@@ -751,45 +750,49 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     return BlocBuilder<MyAuthorStoriesCubit, MyAuthorStoriesState>(
       builder: (context, state) {
         final scheme = Theme.of(context).colorScheme;
-        return AnimatedPadding(
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOut,
-          padding: EdgeInsets.only(bottom: bottomInset),
-          child: Container(
-            decoration: BoxDecoration(
-              color: scheme.surface,
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        return Scaffold(
+          backgroundColor: scheme.surface,
+          appBar: AppBar(
+            backgroundColor: scheme.surface,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+            title: Text(
+              _pageTitle(),
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                color: scheme.onSurface,
+              ),
             ),
+          ),
+          body: SafeArea(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Center(
-                    child: Container(
-                      width: 44,
-                      height: 5,
-                      decoration: BoxDecoration(
-                        color: scheme.outlineVariant,
-                        borderRadius: BorderRadius.circular(999),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: scheme.surfaceContainer,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: scheme.outlineVariant),
+                    ),
+                    child: Text(
+                      _pageDescription(),
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF8B6542),
+                        height: 1.4,
                       ),
                     ),
                   ),
-                  const SizedBox(height: 16),
-                  Text(
-                    _sheetTitle(),
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: scheme.onSurface),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _sheetDescription(),
-                    style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                  ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
                   const _FieldLabel('Ảnh bìa'),
                   const SizedBox(height: 6),
                   InkWell(
@@ -807,27 +810,24 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
                       child: _buildCoverPreview(),
                     ),
                   ),
-                  const SizedBox(height: 14),
-                  const _FieldLabel('Tiêu đề truyện'),
-                  const SizedBox(height: 6),
-                  TextField(controller: _titleController, decoration: _inputDecoration('Ví dụ: Sương mù cuối ngõ')),
-                  const SizedBox(height: 14),
-                  const _FieldLabel('Mô tả'),
-                  const SizedBox(height: 6),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _titleController,
+                    decoration: _inputDecoration('Tiêu đề truyện'),
+                  ),
+                  const SizedBox(height: 12),
                   TextField(
                     controller: _descriptionController,
-                    minLines: 4,
-                    maxLines: 6,
-                    decoration: _inputDecoration('Tóm tắt ngắn về truyện của bạn'),
+                    minLines: 6,
+                    maxLines: null,
+                    decoration: _inputDecoration('Mô tả truyện'),
                   ),
-                  const SizedBox(height: 14),
-                  const _FieldLabel('Tags'),
-                  const SizedBox(height: 6),
+                  const SizedBox(height: 12),
                   TextField(
                     controller: _tagsController,
                     minLines: 1,
                     maxLines: 3,
-                    decoration: _inputDecoration('Ví dụ: cưới trước yêu sau, học đường, chữa lành'),
+                    decoration: _inputDecoration('Tags, ngăn cách bằng dấu phẩy'),
                   ),
                   const SizedBox(height: 6),
                   Text(
@@ -842,21 +842,26 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
                     const SizedBox(height: 12),
                     _ErrorBox(message: _errorMessage!),
                   ],
-                  const SizedBox(height: 18),
+                  const SizedBox(height: 14),
                   SizedBox(
                     width: double.infinity,
-                    height: 48,
+                    height: 46,
                     child: ElevatedButton(
                       onPressed: state.isSaving ? null : _submit,
                       style: ElevatedButton.styleFrom(
-                        elevation: 0,
-                        backgroundColor: scheme.primary,
-                        foregroundColor: scheme.onPrimary,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        backgroundColor: const Color(0xFFC4773A),
+                        foregroundColor: Colors.white,
                       ),
                       child: state.isSaving
-                          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                          : Text(_primaryButtonLabel(), style: const TextStyle(fontWeight: FontWeight.w700)),
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Text(_primaryButtonLabel()),
                     ),
                   ),
                 ],
@@ -868,7 +873,7 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
     );
   }
 
-  String _sheetTitle() => _draftFlow
+  String _pageTitle() => _draftFlow
       ? 'Đưa truyện về bản nháp'
       : _publishFlow
           ? 'Xuất bản truyện'
@@ -876,18 +881,20 @@ class _StoryEditorSheetState extends State<_StoryEditorSheet> {
               ? 'Sửa truyện'
               : 'Tạo truyện mới';
 
-  String _sheetDescription() => _draftFlow
+  String _pageDescription() => _draftFlow
       ? 'Truyện sẽ quay về trạng thái bản nháp và không còn hiển thị công khai.'
       : _publishFlow
-          ? 'Truyện sẽ được gửi sang bước duyệt sau khi lưu.'
-          : 'Cập nhật tiêu đề, mô tả và ảnh bìa của truyện.';
+          ? 'Truyện sẽ được kiểm tra theo quy định nội dung trước khi xuất bản.'
+          : _isEditing
+              ? 'Cập nhật tiêu đề, mô tả, tag và ảnh bìa của truyện.'
+              : 'Điền thông tin để tạo truyện mới.';
 
   String _primaryButtonLabel() => _draftFlow
       ? 'Xác nhận về nháp'
       : _publishFlow
-          ? 'Lưu và xuất bản'
+          ? 'Xuất bản truyện'
           : _isEditing
-              ? 'Lưu thay đổi'
+              ? 'Lưu truyện'
               : 'Tạo truyện';
 
   InputDecoration _inputDecoration(String hint) => InputDecoration(

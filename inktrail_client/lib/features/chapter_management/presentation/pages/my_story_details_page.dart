@@ -108,7 +108,7 @@ class _MyStoryDetailsViewState extends State<_MyStoryDetailsView>
     bool danger = false;
     if (action == 'publish') {
       title = 'Xuất bản chương';
-      body = 'Chương "${chapter.title}" sẽ được xuất bản và quét AI trong nền. Tiếp tục?';
+      body = 'Chương "${chapter.title}" sẽ được kiểm tra theo quy định nội dung trước khi xuất bản. Tiếp tục?';
       actionLabel = 'Xuất bản';
     } else if (action == 'unpublish') {
       title = 'Đưa về nháp';
@@ -145,7 +145,7 @@ class _MyStoryDetailsViewState extends State<_MyStoryDetailsView>
         content: Text(
           error ??
               (action == 'publish'
-                  ? 'Đã gửi chương để duyệt. Bạn kiểm tra lại sau ít phút nhé.'
+                  ? 'Chương đã được xuất bản thành công.'
                   : action == 'unpublish'
                       ? 'Chương đã được đưa về bản nháp.'
                       : 'Đã xóa chương "${chapter.title}".'),
@@ -176,42 +176,54 @@ class _MyStoryDetailsViewState extends State<_MyStoryDetailsView>
       body: BlocBuilder<MyStoryDetailsCubit, MyStoryDetailsState>(
         builder: (context, state) {
           final chapterCount = state.chapters.length;
-          return RefreshIndicator(
-            onRefresh: () => context.read<MyStoryDetailsCubit>().load(story.id),
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-              children: [
-                _StoryHeaderCard(story: story, chapterCount: chapterCount),
-                const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: scheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(color: scheme.outlineVariant),
-                  ),
-                  child: TabBar(
-                    controller: _tabController,
-                    indicator: BoxDecoration(
-                      color: scheme.secondaryContainer,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(color: scheme.outlineVariant, width: 0.5),
+          return SafeArea(
+            top: false,
+            child: RefreshIndicator(
+              onRefresh: () => context.read<MyStoryDetailsCubit>().load(story.id),
+              child: NestedScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                headerSliverBuilder: (context, innerBoxIsScrolled) => [
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      child: Column(
+                        children: [
+                          _StoryHeaderCard(story: story, chapterCount: chapterCount),
+                          const SizedBox(height: 16),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: scheme.surfaceContainerHighest,
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(color: scheme.outlineVariant),
+                            ),
+                            child: TabBar(
+                              controller: _tabController,
+                              indicator: BoxDecoration(
+                                color: scheme.secondaryContainer,
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(color: scheme.outlineVariant, width: 0.5),
+                              ),
+                              indicatorSize: TabBarIndicatorSize.tab,
+                              dividerColor: Colors.transparent,
+                              labelColor: scheme.onSecondaryContainer,
+                              labelStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+                              unselectedLabelColor: scheme.onSurfaceVariant,
+                              unselectedLabelStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                              tabs: const [
+                                Tab(text: 'Chương'),
+                                Tab(text: 'Giới thiệu'),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                        ],
+                      ),
                     ),
-                    indicatorSize: TabBarIndicatorSize.tab,
-                    dividerColor: Colors.transparent,
-                    labelColor: scheme.onSecondaryContainer,
-                    labelStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                    unselectedLabelColor: scheme.onSurfaceVariant,
-                    unselectedLabelStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                    tabs: const [
-                      Tab(text: 'Chương'),
-                      Tab(text: 'Giới thiệu'),
-                    ],
                   ),
-                ),
-                const SizedBox(height: 14),
-                SizedBox(
-                  height: 560,
+                ],
+                body: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                   child: TabBarView(
                     controller: _tabController,
                     children: [
@@ -227,7 +239,7 @@ class _MyStoryDetailsViewState extends State<_MyStoryDetailsView>
                     ],
                   ),
                 ),
-              ],
+              ),
             ),
           );
         },
@@ -380,7 +392,8 @@ class _ChapterTab extends StatelessWidget {
         ),
       );
     }
-    return Column(
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
       children: [
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
@@ -426,42 +439,49 @@ class _ChapterTab extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 12),
-        Expanded(
-          child: isLoading
-              ? const Center(child: CircularProgressIndicator(color: Color(0xFFC4773A)))
-              : chapters.isEmpty
-                  ? const Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.menu_book_rounded, size: 34, color: Color(0xFFD4C9BC)),
-                          SizedBox(height: 10),
-                          Text(
-                            'Chua có chương nào.',
-                            style: TextStyle(
-                              color: Color(0xFF8E8279),
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          SizedBox(height: 4),
-                          Text(
-                            'Tạo chương đầu tiên để bắt đầu phát triển câu chuyện.',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(color: Color(0xFFB1A59A), fontSize: 13),
-                          ),
-                        ],
-                      ),
-                    )
-                  : ListView.separated(
-                      itemCount: chapters.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 12),
-                      itemBuilder: (context, index) {
+        if (isLoading)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 48),
+            child: Center(
+              child: CircularProgressIndicator(color: Color(0xFFC4773A)),
+            ),
+          )
+        else if (chapters.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 48),
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.menu_book_rounded, size: 34, color: Color(0xFFD4C9BC)),
+                  SizedBox(height: 10),
+                  Text(
+                    'Chưa có chương nào.',
+                    style: TextStyle(
+                      color: Color(0xFF8E8279),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Tạo chương đầu tiên để bắt đầu phát triển câu chuyện.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Color(0xFFB1A59A), fontSize: 13),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else
+          ...List.generate(chapters.length, (index) {
                         final chapter = chapters[index];
                         final isPublished = chapter.status == 'published';
                         final canRepublish = chapter.moderationStatus != 'rejected' && chapter.moderationStatus != 'failed';
                         final statusChip = _chapterStatusChip(context, chapter);
-                        return Container(
+                        return Padding(
+                          padding: EdgeInsets.only(bottom: index == chapters.length - 1 ? 0 : 12),
+                          child: Container(
                           padding: const EdgeInsets.all(14),
                           decoration: BoxDecoration(
                             color: scheme.surfaceContainer,
@@ -627,10 +647,9 @@ class _ChapterTab extends StatelessWidget {
                               ),
                             ],
                           ),
+                        ),
                         );
-                      },
-                    ),
-        ),
+                      }),
       ],
     );
   }
@@ -644,6 +663,7 @@ class _InfoTab extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
       children: [
         Container(
           padding: const EdgeInsets.all(16),

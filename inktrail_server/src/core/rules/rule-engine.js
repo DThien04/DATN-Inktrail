@@ -14,7 +14,14 @@ const evaluateRules = ({ rules, context }) => {
     .filter((rule) => {
       try {
         return !rule.validate(safeContext);
-      } catch (_err) {
+      } catch (err) {
+        console.error(
+          "[rule-engine:validate-error]",
+          JSON.stringify({
+            code: rule?.code ?? "unknown_rule",
+            message: err?.message || String(err),
+          }),
+        );
         return true;
       }
     })

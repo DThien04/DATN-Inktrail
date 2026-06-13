@@ -763,6 +763,19 @@ const getReportCaseTargetType = (type) => {
 };
 
 const deriveReportCaseState = ({ type, reports }) => {
+  const accountLockApplied =
+    reports.length > 0 && reports[0]?.reportCase?.accountLockApplied;
+  if (accountLockApplied) {
+    return {
+      status: "resolved",
+      resolutionAction: "account_locked",
+      resolvedAt: reports.reduce((latest, report) => {
+        const candidate = report.resolvedAt ?? report.updatedAt ?? latest;
+        return candidate > latest ? candidate : latest;
+      }, new Date(0)),
+    };
+  }
+
   const hasPending = reports.some((report) => report.status === "pending");
   if (hasPending) {
     return {
@@ -860,6 +873,11 @@ const syncReportCase = async ({ db = prisma, type, caseId }) => {
       createdAt: true,
       updatedAt: true,
       resolvedAt: true,
+      reportCase: {
+        select: {
+          accountLockApplied: true,
+        },
+      },
     },
   });
 
@@ -2830,7 +2848,7 @@ const lockReportCaseAuthor = async ({
   requester,
   reason,
   lockedUntil,
-  alsoResolveContent = true,
+  alsoResolveContent = false,
 }) => {
   const normalizedCaseId = normalizeText(caseId);
   if (!normalizedCaseId) throw new Error("Thiếu thông tin vụ việc.");
@@ -2874,6 +2892,10 @@ const lockReportCaseAuthor = async ({
     await tx.reportCase.update({
       where: { id: reportCase.id },
       data: {
+        status: "resolved",
+        resolutionAction: "account_locked",
+        lastResolutionAction: "account_locked",
+        resolvedAt: new Date(),
         accountLockApplied: true,
         accountLockedUserId: ownerId,
       },

@@ -41,6 +41,7 @@ abstract class ReaderRepository {
   Future<ReaderCommentEntity?> createChapterComment({
     required String chapterId,
     required String content,
+    String? parentId,
   });
 
   Future<ReaderCommentEntity?> updateChapterComment({

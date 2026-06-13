@@ -108,10 +108,12 @@ class SaveChapterCommentUsecase {
   Future<ReaderCommentEntity?> create({
     required String chapterId,
     required String content,
+    String? parentId,
   }) {
     return _repository.createChapterComment(
       chapterId: chapterId,
       content: content,
+      parentId: parentId,
     );
   }
 

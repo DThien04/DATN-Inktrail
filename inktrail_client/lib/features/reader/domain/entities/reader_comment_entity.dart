@@ -2,6 +2,7 @@ class ReaderCommentEntity {
   final String id;
   final String? storyId;
   final String? chapterId;
+  final String? parentId;
   final String userId;
   final String author;
   final String content;
@@ -17,6 +18,7 @@ class ReaderCommentEntity {
     required this.id,
     required this.storyId,
     required this.chapterId,
+    required this.parentId,
     required this.userId,
     required this.author,
     required this.content,

@@ -304,6 +304,7 @@ model ChapterComment {
   id                   String                         @id @default(uuid())
   userId               String                         @map("user_id")
   chapterId            String                         @map("chapter_id")
+  parentId             String?                        @map("parent_id")
   content              String
   isEdited             Boolean                        @default(false) @map("is_edited")
   createdAt            DateTime                       @default(now()) @map("created_at")
@@ -317,6 +318,8 @@ model ChapterComment {
   moderationCategories Json?                          @map("moderation_categories")
   moderationConfidence Float?                         @map("moderation_confidence")
   moderationReason     String?                        @map("moderation_reason")
+  parent               ChapterComment?                @relation("ChapterCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies              ChapterComment[]               @relation("ChapterCommentReplies")
   likes                ChapterCommentLike[]
   reports              ChapterCommentReport[]
   stats                ChapterCommentStat?
@@ -326,6 +329,8 @@ model ChapterComment {
   featuredInChapter    ChapterFeaturedComment?
 
   @@index([chapterId, createdAt])
+  @@index([chapterId, parentId, createdAt])
+  @@index([parentId, createdAt])
   @@index([chapterId, isHidden, createdAt])
   @@index([chapterId, moderationStatus, createdAt])
   @@index([isHidden, hiddenAt])
