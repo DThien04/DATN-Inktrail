@@ -78,7 +78,7 @@ async function parseErrorResponse(response: Response) {
   return rawText || `Request failed with status ${response.status}`;
 }
 
-let refreshPromise = null;
+let refreshPromise: Promise<string | null> | null = null;
 
 async function refreshAccessToken() {
   if (!refreshPromise) {
@@ -220,7 +220,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   if (intercepted.response.status === 204) {
-    return undefined;
+    return undefined as T;
   }
 
   const contentType = intercepted.response.headers.get("content-type") || "";

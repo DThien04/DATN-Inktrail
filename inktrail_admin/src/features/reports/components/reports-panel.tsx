@@ -813,11 +813,11 @@ export function ReportsPanel() {
         selectedWorkflowFilter === "all" ||
         reportCase.workflowStatus === selectedWorkflowFilter;
       const matchesAppealStatus =
-        selectedAppealFilter === "all" ||
-        (selectedAppealFilter === "none" && reportCase.appealStatus === null) ||
-        (selectedAppealFilter !== "all" &&
-          selectedAppealFilter !== "none" &&
-          reportCase.appealStatus === selectedAppealFilter);
+        selectedAppealFilter === "all"
+          ? true
+          : selectedAppealFilter === "none"
+            ? reportCase.appealStatus === null
+            : reportCase.appealStatus === selectedAppealFilter;
       const matchesPriority =
         selectedPriorityFilter === "all" ||
         reportCase.priority === selectedPriorityFilter;
